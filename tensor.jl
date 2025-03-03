@@ -9,10 +9,12 @@ function load_tensor(fname)
         co = map(s -> parse(Int, s), nonzero[1:end-1])
         value = parse(Float64, nonzero[end])
         push!(tensor, tuple(co, value))
-        if length(tensor) % 10000 == 0
+        if length(tensor) % 1000000 == 0
             println("loaded ", length(tensor), " nonzeros")
         end
     end
+    println("loaded ", length(tensor), " nonzeros in total")
+    return tensor
 end
 
 # Compute the prime factors of a number n.
@@ -44,4 +46,38 @@ function compute_processor_dimensions(tensor_dims, nranks)
         proc_dims[furthest] *= primes[i]
     end
     return proc_dims
+end
+
+function get_tensor_dims(tensor)
+    dims = copy(tensor[1][1])
+    for (co, _) in tensor
+        for i=1:length(co)
+            dims[i] = max(co[i], dims[i])
+        end
+    end
+    return dims
+end
+
+function count_nonzeros_per_slice(tensor, tensor_dims)
+    ssizes = [[0 for i=1:tensor_dims[m]] for m=1:length(tensor_dims)]
+    for m=1:length(tensor_dims)
+        for (co, _) in tensor
+            ssizes[m][co[m]] += 1
+        end
+    end
+    return ssizes
+end
+
+# Return the number of rows to communicate for some rank given a tensor and
+# total number of ranks.
+function communication(tensor, rank, nranks)
+    tensor_dims = get_tensor_dims(tensor)
+    proc_dims = compute_processor_dimensions(tensor_dims, nranks)
+    println(proc_dims)
+
+    ssizes = count_nonzeros_per_slice(tensor, tensor_dims)
+    println(ssizes[2])
+
+    # Based on p_rearrange_medium()
+    # TODO: Next, assign nonzeros to processors
 end
