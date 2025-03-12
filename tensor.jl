@@ -1,3 +1,4 @@
+# Load the tensor nonzeros from a FROSTT file
 function load_tensor(fname)
     tensor = []
     for line in eachline(fname)
@@ -68,6 +69,72 @@ function count_nonzeros_per_slice(tensor, tensor_dims)
     return ssizes
 end
 
+# Function based on SPLATT's p_find_layer_boundaries()
+function find_layer_boundaries(tensor, tensor_dims, proc_dims, mode, slice_sizes)
+    layer_dim = proc_dims[mode]
+    taget_nnz = length(tensor) ÷ layer_dim
+    # Initialize the layer pointers
+    layer_ptrs = [0 for i=1:(layer_dim + 1)]
+    layer_ptrs[layer_dim + 1] = tensor_dims[mode]
+    # Drop out early for dimensions of 1
+    if layer_dim == 1
+        return layer_ptrs
+    end
+    # Loop variables
+    curr_proc = 1
+    last_nnzcount = 0
+    nnzcount = slice_sizes[mode][1]
+    for slice=2:tensor_dims[mode]
+        if nnzcount >= (last_nnzcount + target_nnz)
+            # Pick one of the slices to assign, depending on count
+            thisdist = nnzcount - (last_nnzcount + target_nnz)
+        end
+    end
+    # Desired number of nonzeros per logical proces slayer
+    return layer_ptrs
+end
+
+# Build out the entire process grid.
+function create_proc_grid(proc_dims)
+    function create_proc_grid_rec!(mode, co, proc_grid)
+        if mode > length(proc_dims)
+            push!(proc_grid, co)
+            return
+        end
+        for i=1:proc_dims[mode]
+            new_co = copy(co)
+            push!(new_co, i)
+            create_proc_grid_rec!(mode + 1, new_co, proc_grid)
+        end
+    end
+
+    proc_grid = []
+    create_proc_grid_rec!(1, [], proc_grid)
+    return proc_grid
+end
+
+struct Process
+    coords::Array{Int64}
+    layer_starts::Array{Int64}
+    layer_ends::Array{Int64}
+end
+
+function create_procs(proc_dims, layer_ptrs)
+    proc_coords = create_proc_grid(proc_dims)
+    procs = []
+    for co in proc_coords
+        layer_starts = []
+        layer_ends = []
+        for m=1:length(proc_dims)
+            push!(layer_starts, layer_ptrs[m][co[m]])
+            push!(layer_ends, layer_ptrs[m][co[m] + 1])
+        end
+        proc = Process(co, layer_starts, layer_ends)
+        push!(procs, proc)
+    end
+    return procs
+end
+
 # Return the number of rows to communicate for some rank given a tensor and
 # total number of ranks.
 function communication(tensor, rank, nranks)
@@ -76,7 +143,15 @@ function communication(tensor, rank, nranks)
     println(proc_dims)
 
     ssizes = count_nonzeros_per_slice(tensor, tensor_dims)
-    println(ssizes[2])
+    layer_ptrs = []
+    for m=1:length(tensor_dims)
+        push!(layer_ptrs, find_layer_boundaries(tensor, tensor_dims, proc_dims,
+                                                m, ssizes))
+    end
+
+    procs = create_procs(proc_dims, layer_ptrs)
+    println(procs)
+    # println(ssizes[2])
 
     # Based on p_rearrange_medium()
     # TODO: Next, assign nonzeros to processors

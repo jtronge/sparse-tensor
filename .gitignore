@@ -1,2 +1,4 @@
 *.tns
 *.bin
+target/
+Cargo.lock
