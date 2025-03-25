@@ -2,3 +2,7 @@
 name = "sparse-tensor"
 edition = "2021"
 version = "0.0.1"
+
+[dependencies]
+faer = "0.21.7"
+bzip2 = "0.5.2"

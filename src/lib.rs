@@ -1,52 +1,69 @@
 use std::collections::BTreeMap;
-use std::str::FromStr;
-use std::fs::File;
-use std::path::Path;
-use std::io::BufReader;
 use std::io::prelude::*;
+use std::io::{BufReader, Read};
+use std::str::FromStr;
+
+pub struct TensorStream<R: BufRead> {
+    stream: R,
+    line_buf: String,
+}
+
+impl<R: BufRead> TensorStream<R> {
+    pub fn new(stream: R) -> TensorStream<R> {
+        TensorStream {
+            stream,
+            line_buf: String::new(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for TensorStream<R> {
+    type Item = (Vec<usize>, f64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Ok(size) = self.stream.read_line(&mut self.line_buf) {
+            if size == 0 {
+                // EOF
+                break;
+            }
+            let line = self.line_buf.trim();
+            // Skip comments
+            if line.starts_with("#") {
+                continue;
+            }
+            let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+            assert!(parts.len() >= 2);
+            println!("parts: {:?}", parts);
+            // Load coordinates
+            let co: Vec<usize> = parts[..parts.len() - 1]
+                .iter()
+                // Make sure to subtract 1 so we have 0-based indexing
+                .map(|s| usize::from_str_radix(s, 10).expect("failed to parse tensor coordinate") - 1)
+                .collect();
+            let value = f64::from_str(&parts[parts.len() - 1]).expect("failed to parse tensor value");
+            self.line_buf.clear();
+            return Some((co, value));
+        }
+
+        None
+    }
+}
 
 /// Load a tensor from a file.
-pub fn load_tensor<P: AsRef<Path>>(path: P) -> BTreeMap<Vec<usize>, f64> {
-    let file = File::open(path).expect("failed to open tensor file");
-    let mut reader = BufReader::new(file);
-
+pub fn load_tensor<R: Read>(stream: R) -> BTreeMap<Vec<usize>, f64> {
+    let stream = BufReader::new(stream);
+    let loader = TensorStream::new(stream);
     let mut tensor_data = BTreeMap::new();
-    let mut line_buf = String::new();
-    while let Ok(size) = reader.read_line(&mut line_buf) {
-        if size == 0 {
-            // EOF
-            break;
-        }
-        let line = line_buf.trim();
-        // Skip comments
-        if line.starts_with("#") {
-            continue;
-        }
-        let parts: Vec<String> = line
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(parts.len() >= 2);
-        // Load coordinates
-        let co: Vec<usize> = parts[..parts.len()-1]
-            .iter()
-            // Make sure to subtract 1 so we have 0-based indexing
-            .map(|s| usize::from_str_radix(s, 10).expect("failed to parse tensor coordinate") - 1)
-            .collect();
-        let value = f64::from_str(&parts[parts.len() - 1])
-            .expect("failed to parse tensor value");
-        assert!(!tensor_data.contains_key(&co));
+    for (co, value) in loader {
         tensor_data.insert(co, value);
-        line_buf.clear();
     }
-
     tensor_data
 }
 
-/// Get the dimensions of the tensor.
-pub fn get_tensor_dims(tensor_data: &BTreeMap<Vec<usize>, f64>) -> Vec<usize> {
+/// Get the dimensions of a tensor using an iterator over the the nonzeros
+pub fn get_tensor_dims_iter(tensor_iter: impl Iterator<Item = (Vec<usize>, f64)>) -> Vec<usize> {
     let mut tensor_dims = vec![];
-    for (i, (co, _)) in tensor_data.iter().enumerate() {
+    for (i, (co, _)) in tensor_iter.enumerate() {
         if i == 0 {
             tensor_dims.extend(&co[..]);
         }
@@ -60,6 +77,12 @@ pub fn get_tensor_dims(tensor_data: &BTreeMap<Vec<usize>, f64>) -> Vec<usize> {
     }
     assert!(tensor_dims.len() > 0);
     tensor_dims
+}
+
+/// Get the dimensions of the tensor.
+pub fn get_tensor_dims(tensor_data: &BTreeMap<Vec<usize>, f64>) -> Vec<usize> {
+    // TODO: This is not the efficient -- an allocation occurs for each coordinate here
+    get_tensor_dims_iter(tensor_data.iter().map(|(co, value)| (co.to_vec(), *value)))
 }
 
 /// Return a string for representing the dimensions.

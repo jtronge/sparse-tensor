@@ -1,6 +1,7 @@
+use sparse_tensor::{count_nonzeros_per_slice, format_dims, get_tensor_dims, load_tensor};
 use std::collections::BTreeMap;
-use sparse_tensor::{load_tensor, get_tensor_dims, format_dims,
-                    count_nonzeros_per_slice};
+use std::fs::File;
+use std::io::BufReader;
 
 fn get_primes(mut n: usize) -> Vec<usize> {
     let mut primes = vec![];
@@ -24,17 +25,18 @@ fn compute_processor_dimensions(tensor_dims: &[usize], node_count: usize) -> Vec
     let primes = get_primes(node_count);
     let total_nnz: usize = tensor_dims.iter().sum();
     let target_nnz = total_nnz / node_count;
-    let mut proc_dims: Vec<usize> = tensor_dims
-        .iter()
-        .map(|_| 1)
-        .collect();
+    let mut proc_dims: Vec<usize> = tensor_dims.iter().map(|_| 1).collect();
     for i in (0..primes.len()).rev() {
         // Find the mode (tensor dimension) contributing the most nonzeros
         let mut furthest = 0;
         let mut furthest_diff = 0;
         for mode in 0..tensor_dims.len() {
             let curr_nnz = tensor_dims[mode] / proc_dims[mode];
-            let curr_diff = if curr_nnz > target_nnz { curr_nnz - target_nnz } else { 0 };
+            let curr_diff = if curr_nnz > target_nnz {
+                curr_nnz - target_nnz
+            } else {
+                0
+            };
             if curr_diff > furthest_diff {
                 furthest = mode;
                 furthest_diff = curr_diff;
@@ -67,8 +69,8 @@ fn find_layer_boundaries(
             if nnzcount >= (last_nnz + layer_target_nnz) {
                 // Choose which slice to assign based on nonzero count diff
                 let thisdist = nnzcount - (last_nnz + layer_target_nnz);
-                let prevdist = (last_nnz + layer_target_nnz)
-                               - (nnzcount - slice_sizes[mode][slice - 1]);
+                let prevdist =
+                    (last_nnz + layer_target_nnz) - (nnzcount - slice_sizes[mode][slice - 1]);
                 last_nnz = if prevdist < thisdist {
                     nnzcount - slice_sizes[mode][slice - 1]
                 } else {
@@ -100,7 +102,7 @@ fn find_layer_boundaries(
 fn generate_proc_coords(node_count: usize, proc_dims: &[usize]) -> Vec<Vec<usize>> {
     let mut coords = vec![];
     let mut tmp_co: Vec<usize> = (0..proc_dims.len()).map(|_| 0).collect();
-    for i in 0..node_count {
+    for _ in 0..node_count {
         coords.push(tmp_co.to_vec());
         assert_eq!(proc_dims.len(), tmp_co.len());
         // Increment a processor coordinate to the next possible value
@@ -158,26 +160,24 @@ fn create_procs(
     procs
 }
 
-fn distribute_factor_matrix_rows(procs: &[Process]) {
+fn distribute_factor_matrix_rows(_procs: &[Process]) {
+        /*
     for proc in procs {
-/*
-        // Get the max dimension for this layer
-        let max_dim = (0..proc.layer_starts.len())
-            .map(|mode| proc.layer_ends[mode] - proc.layer_starts[mode])
-            .max();
+                // Get the max dimension for this layer
+                let max_dim = (0..proc.layer_starts.len())
+                    .map(|mode| proc.layer_ends[mode] - proc.layer_starts[mode])
+                    .max();
 
-        // Count appearances of indices across all ranks
-        let pcount: Vec<usize> = (0..max_dim).map(|_| 0).collect();
-        let local: Vec<usize> = (0..max_dim).map(|_| 0).collect();
-*/
+                // Count appearances of indices across all ranks
+                let pcount: Vec<usize> = (0..max_dim).map(|_| 0).collect();
+                let local: Vec<usize> = (0..max_dim).map(|_| 0).collect();
     }
+        */
 }
 
 fn main() {
     // Parse args
-    let args: Vec<String> = std::env::args()
-        .map(|arg| arg.to_string())
-        .collect();
+    let args: Vec<String> = std::env::args().map(|arg| arg.to_string()).collect();
     if args.len() != 3 {
         eprintln!("Usage: {} [TENSOR_FILE] [NODE_COUNT]", args[0]);
         return;
@@ -185,9 +185,10 @@ fn main() {
     let tensor_fname = &args[1];
     let node_count = usize::from_str_radix(&args[2], 10)
         .expect("failed to parse command line argument for node count");
-
     // Load the tensor data
-    let tensor_data = load_tensor(tensor_fname);
+    let tensor_file = File::open(tensor_fname).expect("failed to open tensor file");
+    let tensor_reader = BufReader::new(tensor_file);
+    let tensor_data = load_tensor(tensor_reader);
     let tensor_dims = get_tensor_dims(&tensor_data);
     println!("=> tensor dimensions = {}", format_dims(&tensor_dims));
 
@@ -201,8 +202,13 @@ fn main() {
 
     let mut layer_ptrs = vec![];
     for mode in 0..tensor_dims.len() {
-        layer_ptrs.push(find_layer_boundaries(&tensor_data, &tensor_dims,
-                                              &proc_dims, &slice_sizes, mode));
+        layer_ptrs.push(find_layer_boundaries(
+            &tensor_data,
+            &tensor_dims,
+            &proc_dims,
+            &slice_sizes,
+            mode,
+        ));
     }
 
     let proc_coords = generate_proc_coords(node_count, &proc_dims);
