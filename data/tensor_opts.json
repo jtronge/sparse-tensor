@@ -1,0 +1,7 @@
+{
+    "dims": [319686, 28153045, 1607191],
+    "nnz_density": 7.80e-12,
+    "fiber_density": 2.59e-5,
+    "cv_fibers_per_slice": 3.1099,
+    "cv_nonzeros_per_fiber": 73368
+}
