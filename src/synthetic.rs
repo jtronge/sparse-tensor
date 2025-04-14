@@ -2,33 +2,31 @@
 //!
 //! Work based on Torun et al. A Sparse Tensor Generator with Efficient Feature
 //! Extraction. 2025.
-use std::path::Path;
-use std::io::prelude::*;
-use std::io::BufWriter;
 use std::collections::HashSet;
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
 use serde::{Serialize, Deserialize};
+use mpi_sys::{MPI_Comm, MPI_Comm_size, MPI_Comm_rank, MPI_Allreduce, RSMPI_SUM, RSMPI_UINT64_T};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct TensorOptions {
+pub struct TensorOptions {
     /// Tensor dimensions (3-way tensors only for now)
-    dims: Vec<usize>,
+    pub dims: Vec<usize>,
     /// Density of the tensor
-    nnz_density: f64,
+    pub nnz_density: f64,
     /// Fiber density
-    fiber_density: f64,
+    pub fiber_density: f64,
     /// Coefficient of variation of fibers per slice
-    cv_fibers_per_slice: f64,
+    pub cv_fibers_per_slice: f64,
     /// Coefficient of variation of nonzeros per fiber
-    cv_nonzeros_per_fiber: f64,
+    pub cv_nonzeros_per_fiber: f64,
     // TODO: Deal with imbalance
     // /// Imablance of fibers per slice
     // imbal_fiber_per_slice: f64,
     // /// Imbalance of nonzeros per slice
     // imbal_nonzeros_per_fiber: f64,
     /// Seed for the RNG.
-    seed: u64,
+    pub seed: u64,
 }
 
 /// Return n indices each uniformly distributed from [0, limit)
@@ -36,6 +34,54 @@ fn randinds<R: Rng>(n: usize, limit: usize, rng: &mut R) -> Vec<usize> {
     assert!(limit > 0);
     let distr = Uniform::new(0, limit - 1).expect("failed to create uniform distribution");
     (0..n).map(|_| distr.sample(rng)).collect()
+}
+
+/// Random distribution for counts (number of slices, fibers, nonzeros, etc.).
+struct CountDistribution {
+    /// Distribution handle.
+    distr: Normal<f64>,
+
+    /// Use the normal distribution or the log-normal distribution by default
+    use_normal: bool,
+
+    /// Maximum value allowed.
+    max: usize,
+}
+
+impl CountDistribution {
+    /// Create a distribution for a count value.
+    fn new(mean: f64, std_dev: f64, max: usize) -> CountDistribution {
+        // Check whether the normal distribution could generate many negative values
+        let use_normal = mean > (3.0 * std_dev);
+        let distr = if use_normal {
+            Normal::new(mean, std_dev)
+        } else {
+            // Use log-normal only if there is potential for a lot of negative values
+            let mean_log_norm = (mean * mean / (mean * mean + std_dev * std_dev).sqrt()).ln();
+            let std_dev_log_norm = (1.0 + std_dev * std_dev / (mean * mean)).ln().sqrt();
+            Normal::new(mean_log_norm, std_dev_log_norm)
+        };
+        let distr = distr.expect("failed to create normal distribution");
+
+        CountDistribution {
+            distr,
+            use_normal,
+            max,
+        }
+    }
+
+    /// Sample a random count value.
+    fn sample_count<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let count = if self.use_normal {
+            // Use a normal distribution
+            self.distr.sample(rng) as usize
+        } else {
+            // Use a log-normal distribution
+            self.distr.sample(rng).exp() as usize
+        };
+        let count = if count > self.max { self.max } else { count };
+        count as usize
+    }
 }
 
 /// Implementation of the distribute function from the "A Sparse Tensor Generator
@@ -87,13 +133,12 @@ fn distribute<R: Rng>(
 
     // Now generate random indices
     let mut inds = vec![];
-    let mut total = 0;
     for count in counts.iter_mut() {
         *count = std::cmp::min(*count, max);
         // I've noticed that setting the count to 1, if it is zero, can triple
         // the number of nonzeros, or worse. So, commenting it out.
         // *count = std::cmp::max(*count, 1);
-        total += *count;
+
         // Create an array of size counts[i] all in the range [1, limit] ---
         // this is done with a uniform distribution here
         inds.push(randinds(*count, limit, rng));
@@ -102,12 +147,167 @@ fn distribute<R: Rng>(
     (counts, inds)
 }
 
+/// Container RNGs assigned to each slice of the tensor.
+struct SliceRng {
+    /// Start slice on this process
+    local_start_slice: usize,
+    /// RNGs for each slice
+    rngs: Vec<ChaCha8Rng>,
+}
+
+impl SliceRng {
+    fn new(tensor_opts: &TensorOptions, local_start_slice: usize, local_nslices: usize) -> SliceRng {
+        let rngs: Vec<ChaCha8Rng> = (local_start_slice..local_start_slice+local_nslices)
+            .map(|slice| ChaCha8Rng::seed_from_u64(tensor_opts.seed + slice as u64))
+            .collect();
+        SliceRng {
+            local_start_slice,
+            rngs,
+        }
+    }
+
+    /// Get an RNG for a specific slice.
+    pub fn rng(&mut self, slice: usize) -> &mut ChaCha8Rng {
+        &mut self.rngs[slice - self.local_start_slice]
+    }
+}
+
+/// Compare the computed mean with desired mean and scale if it doesn't match exactly.
+///
+/// This performs an allreduce to get the total counts across all ranks.
+fn global_compare_with_expected_and_scale(total_requested: usize, counts: &mut [usize], comm: MPI_Comm) {
+    let local_count: u64 = counts.iter().sum::<usize>() as u64;
+    // Do an allreduce to get the global total.
+    let mut global_count: u64 = 0;
+    // SAFETY: comm is assumed to be valid, as passed by the calling code.
+    unsafe {
+        MPI_Allreduce((&local_count as *const _) as *const _, (&mut global_count as *mut _) as *mut _, 1,
+                      RSMPI_UINT64_T, RSMPI_SUM, comm);
+    }
+    let ratio = total_requested as f64 / global_count as f64;
+    // Scale the counts if the total sum is too large or too small.
+    if ratio < 0.95 || ratio > 1.05 {
+        for count in counts {
+            *count = ((*count as f64) * ratio) as usize;
+        }
+    }
+}
+
+/// Distribute fibers per slice, in parallel, with a different RNG used for each slice.
+///
+/// Based on the distribute function from the "A Sparse Tensor Generator
+/// with Efficient Feature Extraction".
+fn distribute_fibers_per_slice(
+    local_start_slice: usize,
+    local_nslices: usize,
+    total_fibers_requested: usize,
+    mean: f64,
+    std_dev: f64,
+    max: usize,
+    limit: usize,
+    comm: MPI_Comm,
+    slice_rng: &mut SliceRng,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let count_distr = CountDistribution::new(mean, std_dev, max);
+
+    // Generate the fiber counts per slice
+    let mut fcounts_per_slice = vec![];
+    for slice in local_start_slice..local_start_slice + local_nslices {
+        fcounts_per_slice.push(count_distr.sample_count(slice_rng.rng(slice)));
+    }
+
+    global_compare_with_expected_and_scale(total_fibers_requested, &mut fcounts_per_slice[..], comm);
+
+    // Now generate random indices for the fibers
+    let mut fiber_inds = vec![];
+    for (slice, fiber_count) in (local_start_slice..local_start_slice + local_nslices).zip(fcounts_per_slice.iter_mut()) {
+        *fiber_count = std::cmp::min(*fiber_count, max);
+        // I've noticed that setting the count to 1, if it is zero, can triple
+        // the number of nonzeros, or worse. So, commenting it out.
+        // *count = std::cmp::max(*count, 1);
+
+        // Create an array of size fcounts_per_slice[slice] all in the range [1, limit] ---
+        // this is done with a uniform distribution here
+        fiber_inds.push(randinds(*fiber_count, limit, slice_rng.rng(slice)));
+    }
+
+    (fcounts_per_slice, fiber_inds)
+}
+
+/// Distribute nonzero indices per fiber.
+///
+/// This also does an allreduce to ensure that the counts matches the desired amount.
+fn distribute_nnzs_per_fiber(
+    local_start_slice: usize,
+    local_nslices: usize,
+    count_fibers_per_slice: &[usize],
+    local_nonzero_fiber_count: usize,
+    requested_nnz_count: usize,
+    mean: f64,
+    std_dev: f64,
+    max: usize,
+    limit: usize,
+    comm: MPI_Comm,
+    slice_rng: &mut SliceRng,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let count_distr = CountDistribution::new(mean, std_dev, max);
+
+    // Generate the counts
+    let mut nnz_counts = vec![];
+    for slice in local_start_slice..local_start_slice + local_nslices {
+        let fiber_count = count_fibers_per_slice[slice - local_start_slice];
+        for _ in 0..fiber_count {
+            nnz_counts.push(count_distr.sample_count(slice_rng.rng(slice)));
+        }
+    }
+    assert_eq!(nnz_counts.len(), local_nonzero_fiber_count);
+
+    // Compare the computed mean with desired mean and scale if it doesn't match exactly
+    global_compare_with_expected_and_scale(requested_nnz_count, &mut nnz_counts[..], comm);
+
+    // Now generate random indices
+    let mut nnz_inds = vec![];
+    let mut last_count_idx = 0;
+    for slice in local_start_slice..local_start_slice + local_nslices {
+        let fiber_count = count_fibers_per_slice[slice - local_start_slice];
+        for fiber in 0..fiber_count {
+            let nnz_count = &mut nnz_counts[last_count_idx + fiber];
+            *nnz_count = std::cmp::min(*nnz_count, max);
+            // I've noticed that setting the count to 1, if it is zero, can triple
+            // the number of nonzeros, or worse. So, commenting it out.
+            // *count = std::cmp::max(*count, 1);
+
+            // Create an array of size counts[i] all in the range [1, limit] ---
+            // this is done with a uniform distribution here
+            nnz_inds.push(randinds(*nnz_count, limit, slice_rng.rng(slice)));
+        }
+        last_count_idx += fiber_count;
+    }
+
+    (nnz_counts, nnz_inds)
+}
+
 /// Generate a tensor based on the input metrics.
 ///
 /// Based on the following paper:
 ///
 /// Torun et al. A Sparse Tensor Generator with Efficient Feature Extraction. 2025.
-fn gentensor<P: AsRef<Path>>(tensor_fname: P, tensor_opts: TensorOptions) {
+fn gentensor(tensor_opts: TensorOptions, comm: MPI_Comm) -> (Vec<Vec<usize>>, Vec<f64>) {
+    let mut size: c_int = 0;
+    unsafe { MPI_Comm_size(comm, &mut size) };
+    let size: usize = size.try_into().expect("failed to convert size to usize");
+    let mut rank: c_int = 0;
+    unsafe { MPI_Comm_rank(comm, &mut rank) };
+    let rank: usize = rank.try_into().expect("failed to convert rank to usize");
+
+    let slice_count = tensor_opts.dims[0];
+    let slices_per_rank = slice_count / size;
+    let local_start_slice = rank * slices_per_rank;
+    // Each rank gets slices_per_rank slices, with the last one getting any leftovers
+    let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { slice_count % rank } else { 0 };
+    assert!(local_nslices > 0);
+    let mut slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
+
     let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
                                           * tensor_opts.dims[2]) as f64) as usize;
     let slice_count = tensor_opts.dims[0];
@@ -117,65 +317,57 @@ fn gentensor<P: AsRef<Path>>(tensor_fname: P, tensor_opts: TensorOptions) {
     let std_dev_fibers_per_slice = tensor_opts.cv_fibers_per_slice * mean_fibers_per_slice;
     let max_fibers_per_slice = tensor_opts.dims[1];
 
-    // Choose random indices for the slices
-    // TODO: We need a deterministic and portable RNG here (see
-    // https://rust-random.github.io/book/crate-reprod.html#crate-versions).
-    // It looks like ChaCha20Rng could be useful (see
-    // https://rust-random.github.io/book/guide-seeding.html#the-seed-type)
-    let mut rng = rand::rng();
-    // Distribute the number and indices of fibers per slice
-    let (count_fibers_per_slice, fiber_indices_per_slice) = distribute(
-        slice_count,
+    // Compute number and indicies of fibers per slice
+    let (count_fibers_per_slice, fiber_indices) = distribute_fibers_per_slice(
+        local_start_slice,
+        local_nslices,
         nonzero_fiber_count,
         mean_fibers_per_slice,
         std_dev_fibers_per_slice,
         max_fibers_per_slice,
         tensor_opts.dims[1],
-        &mut rng
+        comm,
+        &mut slice_rng,
     );
-    let true_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
+    let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
 
     // Compute nonzeros per fiber
     let mean_nonzeros_per_fiber = nnz as f64 / nonzero_fiber_count as f64;
     let std_dev_nonzeros_per_fiber = tensor_opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
     let max_nonzeros_per_fiber = tensor_opts.dims[2];
-    let (count_nonzeros_per_fiber, nonzero_indices_per_fiber) = distribute(
-        true_nonzero_fiber_count,
+    let (count_nonzeros_per_fiber, nonzero_indices) = distribute_nnzs_per_fiber(
+        local_start_slice,
+        local_nslices,
+        &count_fibers_per_slice[..],
+        local_nonzero_fiber_count,
         nnz,
         mean_nonzeros_per_fiber,
         std_dev_nonzeros_per_fiber,
         max_nonzeros_per_fiber,
         tensor_opts.dims[2],
-        &mut rng,
+        comm,
+        &mut slice_rng,
     );
-    let f = std::fs::File::create(tensor_fname).expect("failed to create file");
-    let mut tensor_file = BufWriter::new(f);
+
     let value_distr = Uniform::new(0.0, 1.0).expect("failed to create uniform distribution for tensor values");
-    // Iterate over all slices
-    let mut fiber_idx = 0;
-    let mut total_nnz = 0;
-    for i in 0..slice_count {
-        let mut slice_coords = HashSet::new();
-        // Iterate over all fibers of this slice
-        for j in 0..count_fibers_per_slice[i] {
-            for k in 0..count_nonzeros_per_fiber[fiber_idx] {
-                let value: f64 = value_distr.sample(&mut rng);
-                let co = (fiber_indices_per_slice[i][j], nonzero_indices_per_fiber[fiber_idx][k]);
-                // Skip duplicate coordinates
-                //if slice_coords.contains(&co) {
-                //    continue;
-                //}
-                writeln!(&mut tensor_file, "{} {} {} {:.4}", i + 1, co.0 + 1, co.1 + 1, value)
-                    .expect("failed to write tensor entry");
-                slice_coords.insert(co);
+    let mut fiber_nnz_idx = 0;
+    let mut co = vec![vec![]; 3];
+    let mut vals = vec![];
+    for slice in local_start_slice..local_start_slice + local_nslices {
+        for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
+            for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
+                co[0].push(slice);
+                co[1].push(fiber_indices[slice][fiber]);
+                co[2].push(nonzero_indices[fiber_nnz_idx][k]);
+                vals.push(value_distr.sample(slice_rng.rng(slice)));
             }
-            fiber_idx += 1;
+            fiber_nnz_idx += 1;
         }
-        total_nnz += slice_coords.len();
     }
+    (co, vals)
 }
 
-use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 pub fn generate_slice(tensor_opts: TensorOptions, slice: usize, co: &mut [Vec<usize>], vals: &mut Vec<f64>) {
@@ -218,7 +410,7 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_options_load(fname: *const c_ch
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparse_tensor_synthetic_options_free(opts_handle: *mut c_void) {
-    Box::from_raw(opts_handle as *mut TensorOptions);
+    let _ = Box::from_raw(opts_handle as *mut TensorOptions);
 }
 
 #[repr(C)]
@@ -232,32 +424,23 @@ pub struct SyntheticTensor {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sparse_tensor_synthetic_generate(opts_handle: *mut c_void, size: c_int, rank: c_int) -> *mut SyntheticTensor {
+pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
+    opts_handle: *mut c_void,
+    comm: MPI_Comm,
+) -> *mut SyntheticTensor {
     let tensor_opts = opts_handle as *mut TensorOptions;
-    let size: usize = size.try_into().expect("failed to convert size to usize");
-    let rank: usize = rank.try_into().expect("failed to convert rank to usize");
-    // Determine the total number of slices and the slices local to this process
-    let nslices = (*tensor_opts).dims[0];
-    let slices_per_rank = nslices / size;
-    let local_start_slice = rank * slices_per_rank;
-    // Each rank gets slices_per_rank slices, with the last one getting any leftovers
-    let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { nslices % rank } else { 0 };
-    assert!(local_nslices > 0);
 
-    let mut co = vec![vec![]; 3];
-    let mut vals = vec![];
-    for i in local_start_slice..(local_start_slice + slices_per_rank) {
-        generate_slice((*tensor_opts).clone(), i, &mut co, &mut vals);
-    }
+    let (co, vals) = gentensor((*tensor_opts).clone(), comm);
 
+    // Some ugly manual mem to work properly with C
     assert_eq!(co[0].len(), vals.len());
     let local_nnz = co[0].len();
-    let val_layout = Layout::array::<f64>(local_nslices)
+    let val_layout = Layout::array::<f64>(local_nnz)
         .expect("failed to create memory layout for tensor values");
     let val_ptr = alloc(val_layout);
     std::ptr::copy_nonoverlapping(vals.as_ptr(), val_ptr as *mut _, local_nnz);
     assert_ne!(val_ptr, std::ptr::null_mut());
-    let co_layout = Layout::array::<usize>(local_nslices)
+    let co_layout = Layout::array::<usize>(local_nnz)
         .expect("failed to create memory layout for tensor coordinates");
     let mut co_ptrs: Vec<*mut usize> = (0..3).map(|i| {
         let co_ptr = alloc(co_layout);
@@ -287,53 +470,3 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_free(stensor: *mut SyntheticTen
         dealloc(co_ptr as *mut _, co_layout);
     }
 }
-
-/*
-use clap::Parser;
-/// Synthetic tensor generator tool
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// File name or path to output tensor
-    #[arg(short, long, required = true)]
-    fname: String,
-
-    /// Dimensions in form {num}x{num}x...
-    #[arg(short, long, required = true)]
-    dims: String,
-
-    /// Density of the tensor
-    #[arg(long, required = true)]
-    density: f64,
-
-    /// Density of fibers in the tensor
-    #[arg(long, required = true)]
-    fiber_density: f64,
-
-    /// Coefficient of variation of number of fibers per slice
-    #[arg(long, required = true)]
-    cv_fiber_slice: f64,
-
-    /// Coefficient of variation of number of nonzeros per fiber
-    #[arg(long, required = true)]
-    cv_nonzero_fiber: f64,
-}
-
-fn main() {
-    let args = Args::parse();
-
-    let dims: Vec<usize> = args.dims
-        .split('x')
-        .map(|v| usize::from_str_radix(v, 10).expect("invalid dimensions specified"))
-        .collect();
-    // Only supporting 3-way tensors for right now
-    assert_eq!(dims.len(), 3);
-    gentensor(args.fname, TensorOptions {
-        dims,
-        nnz_density: args.density,
-        fiber_density: args.fiber_density,
-        cv_fibers_per_slice: args.cv_fiber_slice,
-        cv_nonzeros_per_fiber: args.cv_nonzero_fiber,
-    });
-}
-*/

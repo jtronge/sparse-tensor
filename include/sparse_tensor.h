@@ -15,7 +15,7 @@ struct sparse_tensor_synthetic {
 };
 
 /* Generate a synthetic tensor using the options handle */
-struct sparse_tensor_synthetic *sparse_tensor_synthetic_generate(void *opts_handle, int size, int rank);
+struct sparse_tensor_synthetic *sparse_tensor_synthetic_generate(void *opts_handle, MPI_Comm comm);
 /* Free the synthetic tensor */
 void sparse_tensor_synthetic_free(struct sparse_tensor_synthetic *tensor);
 

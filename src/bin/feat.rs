@@ -27,7 +27,7 @@ fn main() {
 
     // Organize into slices
     let mut slices = vec![vec![]; dims[0]];
-    for (co, value) in &tensor {
+    for (co, _) in &tensor {
         slices[co[0]].push(co.to_vec());
     }
     println!("nnz: {}", tensor.len());
