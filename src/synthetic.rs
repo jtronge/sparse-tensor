@@ -173,8 +173,11 @@ fn gentensor<P: AsRef<Path>>(tensor_fname: P, tensor_opts: TensorOptions) {
     }
 }
 
-use std::os::raw::{c_char, c_void};
+// TODO: Code below should go in a separate submodule for C ffi
+
+use std::os::raw::{c_char, c_int, c_void};
 use std::ffi::CStr;
+use std::alloc::{alloc, dealloc, Layout};
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparse_tensor_synthetic_options_load(fname: *const c_char) -> *mut c_void {
@@ -194,9 +197,77 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_options_free(opts_handle: *mut 
     Box::from_raw(opts_handle as *mut TensorOptions);
 }
 
+#[repr(C)]
+pub struct SyntheticTensor {
+    /// Number of nonzeros.
+    nnz: usize,
+    /// Entry coordinates.
+    co: [*mut usize; 3],
+    /// Values for each nonzero.
+    vals: *mut f64,
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn sparse_tensor_synthetic_generate(opts_handle: *mut c_void) {
-    // TODO
+pub unsafe extern "C" fn sparse_tensor_synthetic_generate(opts_handle: *mut c_void, size: c_int, rank: c_int) -> *mut SyntheticTensor {
+    let tensor_opts = opts_handle as *mut TensorOptions;
+    let size: usize = size.try_into().expect("failed to convert size to usize");
+    let rank: usize = rank.try_into().expect("failed to convert rank to usize");
+    // Determine the total number of slices and the slices local to this process
+    let nslices = (*tensor_opts).dims[0];
+    let slices_per_rank = nslices / size;
+    let local_start_slice = rank * slices_per_rank;
+    // Each rank gets slices_per_rank slices, with the last one getting any leftovers
+    let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { nslices % rank } else { 0 };
+    assert!(local_nslices > 0);
+    let mut co = vec![vec![]; 3];
+    let mut vals = vec![];
+
+    // TODO: Actually generate tensor data here
+    println!("generating {} nonzeros", slices_per_rank);
+    println!("local_start_slice {}", local_start_slice);
+    for i in local_start_slice..(local_start_slice + slices_per_rank) {
+        co[0].push(i);
+        co[1].push(i);
+        co[2].push(i);
+        vals.push(1.0);
+    }
+
+    assert_eq!(co[0].len(), vals.len());
+    let local_nnz = co[0].len();
+    let val_layout = Layout::array::<f64>(local_nslices)
+        .expect("failed to create memory layout for tensor values");
+    let val_ptr = alloc(val_layout);
+    std::ptr::copy_nonoverlapping(vals.as_ptr(), val_ptr as *mut _, local_nnz);
+    assert_ne!(val_ptr, std::ptr::null_mut());
+    let co_layout = Layout::array::<usize>(local_nslices)
+        .expect("failed to create memory layout for tensor coordinates");
+    let mut co_ptrs: Vec<*mut usize> = (0..3).map(|i| {
+        let co_ptr = alloc(co_layout);
+        assert_ne!(co_ptr, std::ptr::null_mut());
+        std::ptr::copy_nonoverlapping(co[i].as_ptr(), co_ptr as *mut _, local_nnz);
+        co_ptr as *mut _
+    }).collect();
+    let stensor = SyntheticTensor {
+        nnz: local_nnz,
+        co: co_ptrs[..].try_into().expect("failed to convert from vec to array in struct"),
+        vals: val_ptr as *mut _,
+    };
+    Box::into_raw(Box::new(stensor))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sparse_tensor_synthetic_free(stensor: *mut SyntheticTensor) {
+    println!("freeing tensor....");
+    let stensor = Box::from_raw(stensor);
+    let nnz = stensor.nnz;
+    let val_layout = Layout::array::<f64>(nnz)
+        .expect("failed to create memory layout for tensor values");
+    dealloc(stensor.vals as *mut _, val_layout);
+    let co_layout = Layout::array::<usize>(nnz)
+        .expect("failed to create memory layout for tensor coordinates");
+    for co_ptr in stensor.co {
+        dealloc(co_ptr as *mut _, co_layout);
+    }
 }
 
 /*

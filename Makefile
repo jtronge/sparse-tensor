@@ -9,6 +9,9 @@ CFLAGS = -Iinclude
 all: $(SPARSE_TENSOR_LIB) $(EXAMPLE_BINS)
 .PHONY: all
 
+$(SPARSE_TENSOR_LIB): $(SPARSE_TENSOR_FILES)
+	cargo build --release
+
 $(EXAMPLE_BINS): $(SPARSE_TENSOR_LIB)
 $(EXAMPLE_BINS): %: %.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
