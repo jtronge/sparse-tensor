@@ -6,3 +6,6 @@ version = "0.0.1"
 [dependencies]
 faer = "0.21.7"
 bzip2 = "0.5.2"
+rand = "0.9.0"
+rand_distr = "0.5.1"
+rand_chacha = "0.9.0"

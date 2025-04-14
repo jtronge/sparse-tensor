@@ -3,6 +3,8 @@ use std::io::prelude::*;
 use std::io::{BufReader, Read};
 use std::str::FromStr;
 
+pub mod synthetic;
+
 pub struct TensorStream<R: BufRead> {
     stream: R,
     line_buf: String,
@@ -33,7 +35,6 @@ impl<R: BufRead> Iterator for TensorStream<R> {
             }
             let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
             assert!(parts.len() >= 2);
-            println!("parts: {:?}", parts);
             // Load coordinates
             let co: Vec<usize> = parts[..parts.len() - 1]
                 .iter()
@@ -60,20 +61,53 @@ pub fn load_tensor<R: Read>(stream: R) -> BTreeMap<Vec<usize>, f64> {
     tensor_data
 }
 
+pub trait Coordinate {
+    /// Return a coordinate value for the point.
+    fn co(&self, m: usize) -> usize;
+
+    /// Number of modes in a tensor.
+    fn modes(&self) -> usize;
+}
+
+impl Coordinate for Vec<usize> {
+    fn co(&self, m: usize) -> usize {
+        self[m]
+    }
+
+    fn modes(&self) -> usize {
+        self.len()
+    }
+}
+
+impl Coordinate for &[usize] {
+    fn co(&self, m: usize) -> usize {
+        self[m]
+    }
+
+    fn modes(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Get the dimensions of a tensor using an iterator over the the nonzeros
-pub fn get_tensor_dims_iter(tensor_iter: impl Iterator<Item = (Vec<usize>, f64)>) -> Vec<usize> {
+pub fn get_tensor_dims_iter<C>(tensor_iter: impl Iterator<Item = (C, f64)>) -> Vec<usize>
+where
+    C: Coordinate,
+{
     let mut tensor_dims = vec![];
     for (i, (co, _)) in tensor_iter.enumerate() {
         if i == 0 {
-            tensor_dims.extend(&co[..]);
+            for m in 0..co.modes() {
+                tensor_dims.push(co.co(m));
+            }
         }
-        assert_eq!(co.len(), tensor_dims.len());
-        for j in 0..co.len() {
-            tensor_dims[j] = std::cmp::max(tensor_dims[j], co[j]);
+        assert_eq!(co.modes(), tensor_dims.len());
+        for m in 0..co.modes() {
+            tensor_dims[m] = std::cmp::max(tensor_dims[m], co.co(m));
         }
     }
-    for j in 0..tensor_dims.len() {
-        tensor_dims[j] += 1;
+    for m in 0..tensor_dims.len() {
+        tensor_dims[m] += 1;
     }
     assert!(tensor_dims.len() > 0);
     tensor_dims
@@ -81,8 +115,7 @@ pub fn get_tensor_dims_iter(tensor_iter: impl Iterator<Item = (Vec<usize>, f64)>
 
 /// Get the dimensions of the tensor.
 pub fn get_tensor_dims(tensor_data: &BTreeMap<Vec<usize>, f64>) -> Vec<usize> {
-    // TODO: This is not the efficient -- an allocation occurs for each coordinate here
-    get_tensor_dims_iter(tensor_data.iter().map(|(co, value)| (co.to_vec(), *value)))
+    get_tensor_dims_iter(tensor_data.iter().map(|(co, value)| (&co[..], *value)))
 }
 
 /// Return a string for representing the dimensions.
