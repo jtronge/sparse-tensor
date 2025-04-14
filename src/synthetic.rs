@@ -10,7 +10,7 @@ use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct TensorOptions {
     /// Tensor dimensions (3-way tensors only for now)
     dims: Vec<usize>,
@@ -27,6 +27,8 @@ struct TensorOptions {
     // imbal_fiber_per_slice: f64,
     // /// Imbalance of nonzeros per slice
     // imbal_nonzeros_per_fiber: f64,
+    /// Seed for the RNG.
+    seed: u64,
 }
 
 /// Return n indices each uniformly distributed from [0, limit)
@@ -173,6 +175,28 @@ fn gentensor<P: AsRef<Path>>(tensor_fname: P, tensor_opts: TensorOptions) {
     }
 }
 
+use rand_chacha::rand_core::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+pub fn generate_slice(tensor_opts: TensorOptions, slice: usize, co: &mut [Vec<usize>], vals: &mut Vec<f64>) {
+    // Seed the RNG with the slice number + input seed.
+    let mut rng = ChaCha8Rng::seed_from_u64(tensor_opts.seed + slice as u64);
+    let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
+                                          * tensor_opts.dims[2]) as f64) as usize;
+    let slice_count = tensor_opts.dims[0];
+    let nonzero_fiber_count = (tensor_opts.fiber_density
+                               * (slice_count * tensor_opts.dims[1]) as f64) as usize;
+    let mean_fibers_per_slice = nonzero_fiber_count as f64 / slice_count as f64;
+    let std_dev_fibers_per_slice = tensor_opts.cv_fibers_per_slice * mean_fibers_per_slice;
+    let max_fibers_per_slice = tensor_opts.dims[1];
+
+    // TODO
+    let mean_nonzeros_per_fiber = nnz as f64 / nonzero_fiber_count as f64;
+    let std_dev_nonzeros_per_fiber = tensor_opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
+    let max_nonzeros_per_fiber = tensor_opts.dims[2];
+    let value_distr = Uniform::new(0.0, 1.0).expect("failed to create uniform distribution for tensor values");
+}
+
 // TODO: Code below should go in a separate submodule for C ffi
 
 use std::os::raw::{c_char, c_int, c_void};
@@ -219,17 +243,11 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(opts_handle: *mut c_vo
     // Each rank gets slices_per_rank slices, with the last one getting any leftovers
     let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { nslices % rank } else { 0 };
     assert!(local_nslices > 0);
+
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
-
-    // TODO: Actually generate tensor data here
-    println!("generating {} nonzeros", slices_per_rank);
-    println!("local_start_slice {}", local_start_slice);
     for i in local_start_slice..(local_start_slice + slices_per_rank) {
-        co[0].push(i);
-        co[1].push(i);
-        co[2].push(i);
-        vals.push(1.0);
+        generate_slice((*tensor_opts).clone(), i, &mut co, &mut vals);
     }
 
     assert_eq!(co[0].len(), vals.len());
