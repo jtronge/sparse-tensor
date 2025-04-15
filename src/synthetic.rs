@@ -357,7 +357,7 @@ fn gentensor(tensor_opts: TensorOptions, comm: MPI_Comm) -> (Vec<Vec<usize>>, Ve
         for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
             for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
                 co[0].push(slice);
-                co[1].push(fiber_indices[slice][fiber]);
+                co[1].push(fiber_indices[slice - local_start_slice][fiber]);
                 co[2].push(nonzero_indices[fiber_nnz_idx][k]);
                 vals.push(value_distr.sample(slice_rng.rng(slice)));
             }
