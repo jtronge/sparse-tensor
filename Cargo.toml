@@ -15,3 +15,7 @@ mpi-sys = "0.2.2"
 
 [lib]
 crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "unique_tensor"
+path = "mpi_tests/unique_tensor.rs"

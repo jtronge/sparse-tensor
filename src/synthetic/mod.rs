@@ -3,10 +3,16 @@
 //! Work based on Torun et al. A Sparse Tensor Generator with Efficient Feature
 //! Extraction. 2025.
 use std::collections::HashSet;
+use std::os::raw::c_int;
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
+use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
-use mpi_sys::{MPI_Comm, MPI_Comm_size, MPI_Comm_rank, MPI_Allreduce, RSMPI_SUM, RSMPI_UINT64_T};
+
+use crate::comm::{self, Comm};
+
+mod c_api;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TensorOptions {
@@ -84,69 +90,6 @@ impl CountDistribution {
     }
 }
 
-/// Implementation of the distribute function from the "A Sparse Tensor Generator
-/// with Efficient Feature Extraction".
-fn distribute<R: Rng>(
-    n: usize,
-    count_requested: usize,
-    mean: f64,
-    std_dev: f64,
-    max: usize,
-    limit: usize,
-    rng: &mut R,
-) -> (Vec<usize>, Vec<Vec<usize>>) {
-    // Check whether the normal distribution could generate many negative values
-    let use_normal = mean > (3.0 * std_dev);
-    let distr = if use_normal {
-        Normal::new(mean, std_dev)
-    } else {
-        // Use log-normal only if there is potential for a lot of negative values
-        let mean_log_norm = (mean * mean / (mean * mean + std_dev * std_dev).sqrt()).ln();
-        let std_dev_log_norm = (1.0 + std_dev * std_dev / (mean * mean)).ln().sqrt();
-        Normal::new(mean_log_norm, std_dev_log_norm)
-    };
-    let distr = distr.expect("failed to create distribution");
-
-    // Generate the counts
-    let mut counts = vec![];
-    for _ in 0..n {
-        let count = if use_normal {
-            // Use a normal distribution
-            distr.sample(rng) as usize
-        } else {
-            // Use a log-normal distribution
-            distr.sample(rng).exp() as usize
-            // counts.push(distr.sample(rng).exp() as usize);
-        };
-        let count = if count > max { max } else { count };
-        counts.push(count);
-    }
-
-    // Compare the computed mean with desired mean and scale if it doesn't match exactly
-    let total: usize = counts.iter().sum();
-    let ratio = count_requested as f64 / total as f64;
-    if ratio < 0.95 || ratio > 1.05 {
-        for count in &mut counts {
-            *count = ((*count as f64) * ratio) as usize;
-        }
-    }
-
-    // Now generate random indices
-    let mut inds = vec![];
-    for count in counts.iter_mut() {
-        *count = std::cmp::min(*count, max);
-        // I've noticed that setting the count to 1, if it is zero, can triple
-        // the number of nonzeros, or worse. So, commenting it out.
-        // *count = std::cmp::max(*count, 1);
-
-        // Create an array of size counts[i] all in the range [1, limit] ---
-        // this is done with a uniform distribution here
-        inds.push(randinds(*count, limit, rng));
-    }
-
-    (counts, inds)
-}
-
 /// Container RNGs assigned to each slice of the tensor.
 struct SliceRng {
     /// Start slice on this process
@@ -175,15 +118,11 @@ impl SliceRng {
 /// Compare the computed mean with desired mean and scale if it doesn't match exactly.
 ///
 /// This performs an allreduce to get the total counts across all ranks.
-fn global_compare_with_expected_and_scale(total_requested: usize, counts: &mut [usize], comm: MPI_Comm) {
+fn global_compare_with_expected_and_scale(total_requested: usize, counts: &mut [usize], comm: &Comm) {
     let local_count: u64 = counts.iter().sum::<usize>() as u64;
     // Do an allreduce to get the global total.
     let mut global_count: u64 = 0;
-    // SAFETY: comm is assumed to be valid, as passed by the calling code.
-    unsafe {
-        MPI_Allreduce((&local_count as *const _) as *const _, (&mut global_count as *mut _) as *mut _, 1,
-                      RSMPI_UINT64_T, RSMPI_SUM, comm);
-    }
+    comm.allreduce(&local_count, &mut global_count, comm::Operation::Sum);
     let ratio = total_requested as f64 / global_count as f64;
     // Scale the counts if the total sum is too large or too small.
     if ratio < 0.95 || ratio > 1.05 {
@@ -205,7 +144,7 @@ fn distribute_fibers_per_slice(
     std_dev: f64,
     max: usize,
     limit: usize,
-    comm: MPI_Comm,
+    comm: &Comm,
     slice_rng: &mut SliceRng,
 ) -> (Vec<usize>, Vec<Vec<usize>>) {
     let count_distr = CountDistribution::new(mean, std_dev, max);
@@ -247,7 +186,7 @@ fn distribute_nnzs_per_fiber(
     std_dev: f64,
     max: usize,
     limit: usize,
-    comm: MPI_Comm,
+    comm: &Comm,
     slice_rng: &mut SliceRng,
 ) -> (Vec<usize>, Vec<Vec<usize>>) {
     let count_distr = CountDistribution::new(mean, std_dev, max);
@@ -292,13 +231,9 @@ fn distribute_nnzs_per_fiber(
 /// Based on the following paper:
 ///
 /// Torun et al. A Sparse Tensor Generator with Efficient Feature Extraction. 2025.
-fn gentensor(tensor_opts: TensorOptions, comm: MPI_Comm) -> (Vec<Vec<usize>>, Vec<f64>) {
-    let mut size: c_int = 0;
-    unsafe { MPI_Comm_size(comm, &mut size) };
-    let size: usize = size.try_into().expect("failed to convert size to usize");
-    let mut rank: c_int = 0;
-    unsafe { MPI_Comm_rank(comm, &mut rank) };
-    let rank: usize = rank.try_into().expect("failed to convert rank to usize");
+pub fn gentensor(tensor_opts: TensorOptions, comm: &Comm) -> (Vec<Vec<usize>>, Vec<f64>) {
+    let size = comm.size();
+    let rank = comm.rank();
 
     let slice_count = tensor_opts.dims[0];
     let slices_per_rank = slice_count / size;
@@ -365,108 +300,4 @@ fn gentensor(tensor_opts: TensorOptions, comm: MPI_Comm) -> (Vec<Vec<usize>>, Ve
         }
     }
     (co, vals)
-}
-
-use rand_chacha::rand_core::SeedableRng;
-use rand_chacha::ChaCha8Rng;
-
-pub fn generate_slice(tensor_opts: TensorOptions, slice: usize, co: &mut [Vec<usize>], vals: &mut Vec<f64>) {
-    // Seed the RNG with the slice number + input seed.
-    let mut rng = ChaCha8Rng::seed_from_u64(tensor_opts.seed + slice as u64);
-    let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
-                                          * tensor_opts.dims[2]) as f64) as usize;
-    let slice_count = tensor_opts.dims[0];
-    let nonzero_fiber_count = (tensor_opts.fiber_density
-                               * (slice_count * tensor_opts.dims[1]) as f64) as usize;
-    let mean_fibers_per_slice = nonzero_fiber_count as f64 / slice_count as f64;
-    let std_dev_fibers_per_slice = tensor_opts.cv_fibers_per_slice * mean_fibers_per_slice;
-    let max_fibers_per_slice = tensor_opts.dims[1];
-
-    // TODO
-    let mean_nonzeros_per_fiber = nnz as f64 / nonzero_fiber_count as f64;
-    let std_dev_nonzeros_per_fiber = tensor_opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
-    let max_nonzeros_per_fiber = tensor_opts.dims[2];
-    let value_distr = Uniform::new(0.0, 1.0).expect("failed to create uniform distribution for tensor values");
-}
-
-// TODO: Code below should go in a separate submodule for C ffi
-
-use std::os::raw::{c_char, c_int, c_void};
-use std::ffi::CStr;
-use std::alloc::{alloc, dealloc, Layout};
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sparse_tensor_synthetic_options_load(fname: *const c_char) -> *mut c_void {
-    let fname = CStr::from_ptr(fname).to_string_lossy().to_string();
-    let file_text_result = std::fs::read_to_string(&fname);
-    if file_text_result.is_err() {
-        eprintln!("sparse_tensor: failed to open {}", fname);
-        return std::ptr::null_mut();
-    }
-    let file_text = file_text_result.expect("should not be possible");
-    let opts: TensorOptions = serde_json::from_str(&file_text).expect("failed to parse tensor options");
-    Box::into_raw(Box::new(opts)) as *mut c_void
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sparse_tensor_synthetic_options_free(opts_handle: *mut c_void) {
-    let _ = Box::from_raw(opts_handle as *mut TensorOptions);
-}
-
-#[repr(C)]
-pub struct SyntheticTensor {
-    /// Number of nonzeros.
-    nnz: usize,
-    /// Entry coordinates.
-    co: [*mut usize; 3],
-    /// Values for each nonzero.
-    vals: *mut f64,
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
-    opts_handle: *mut c_void,
-    comm: MPI_Comm,
-) -> *mut SyntheticTensor {
-    let tensor_opts = opts_handle as *mut TensorOptions;
-
-    let (co, vals) = gentensor((*tensor_opts).clone(), comm);
-
-    // Some ugly manual mem to work properly with C
-    assert_eq!(co[0].len(), vals.len());
-    let local_nnz = co[0].len();
-    let val_layout = Layout::array::<f64>(local_nnz)
-        .expect("failed to create memory layout for tensor values");
-    let val_ptr = alloc(val_layout);
-    std::ptr::copy_nonoverlapping(vals.as_ptr(), val_ptr as *mut _, local_nnz);
-    assert_ne!(val_ptr, std::ptr::null_mut());
-    let co_layout = Layout::array::<usize>(local_nnz)
-        .expect("failed to create memory layout for tensor coordinates");
-    let mut co_ptrs: Vec<*mut usize> = (0..3).map(|i| {
-        let co_ptr = alloc(co_layout);
-        assert_ne!(co_ptr, std::ptr::null_mut());
-        std::ptr::copy_nonoverlapping(co[i].as_ptr(), co_ptr as *mut _, local_nnz);
-        co_ptr as *mut _
-    }).collect();
-    let stensor = SyntheticTensor {
-        nnz: local_nnz,
-        co: co_ptrs[..].try_into().expect("failed to convert from vec to array in struct"),
-        vals: val_ptr as *mut _,
-    };
-    Box::into_raw(Box::new(stensor))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sparse_tensor_synthetic_free(stensor: *mut SyntheticTensor) {
-    println!("freeing tensor....");
-    let stensor = Box::from_raw(stensor);
-    let nnz = stensor.nnz;
-    let val_layout = Layout::array::<f64>(nnz)
-        .expect("failed to create memory layout for tensor values");
-    dealloc(stensor.vals as *mut _, val_layout);
-    let co_layout = Layout::array::<usize>(nnz)
-        .expect("failed to create memory layout for tensor coordinates");
-    for co_ptr in stensor.co {
-        dealloc(co_ptr as *mut _, co_layout);
-    }
 }
