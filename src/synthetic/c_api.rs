@@ -2,10 +2,11 @@
 use std::os::raw::{c_char, c_void};
 use std::ffi::CStr;
 use std::alloc::{alloc, dealloc, Layout};
-use mpi_sys::MPI_Comm;
+use mpi::topology::SimpleCommunicator;
+use mpi::raw::FromRaw;
+use mpi::ffi::MPI_Comm;
 
 use crate::synthetic::{TensorOptions, gentensor};
-use crate::comm::Comm;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparse_tensor_synthetic_options_load(fname: *const c_char) -> *mut c_void {
@@ -42,7 +43,7 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
 ) -> *mut SyntheticTensor {
     let tensor_opts = opts_handle as *mut TensorOptions;
 
-    let (co, vals) = gentensor((*tensor_opts).clone(), &Comm::from_raw(comm));
+    let (co, vals) = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(comm));
 
     // Some ugly manual mem to work properly with C
     assert_eq!(co[0].len(), vals.len());

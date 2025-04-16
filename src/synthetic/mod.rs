@@ -9,8 +9,8 @@ use rand_distr::{Normal, Uniform};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
-
-use crate::comm::{self, Comm};
+use mpi::traits::*;
+use mpi::collective::SystemOperation;
 
 mod c_api;
 
@@ -118,11 +118,14 @@ impl SliceRng {
 /// Compare the computed mean with desired mean and scale if it doesn't match exactly.
 ///
 /// This performs an allreduce to get the total counts across all ranks.
-fn global_compare_with_expected_and_scale(total_requested: usize, counts: &mut [usize], comm: &Comm) {
+fn global_compare_with_expected_and_scale<C>(total_requested: usize, counts: &mut [usize], comm: &C)
+where
+    C: AnyCommunicator,
+{
     let local_count: u64 = counts.iter().sum::<usize>() as u64;
     // Do an allreduce to get the global total.
     let mut global_count: u64 = 0;
-    comm.allreduce(&local_count, &mut global_count, comm::Operation::Sum);
+    comm.all_reduce_into(&local_count, &mut global_count, SystemOperation::sum());
     let ratio = total_requested as f64 / global_count as f64;
     // Scale the counts if the total sum is too large or too small.
     if ratio < 0.95 || ratio > 1.05 {
@@ -136,7 +139,7 @@ fn global_compare_with_expected_and_scale(total_requested: usize, counts: &mut [
 ///
 /// Based on the distribute function from the "A Sparse Tensor Generator
 /// with Efficient Feature Extraction".
-fn distribute_fibers_per_slice(
+fn distribute_fibers_per_slice<C>(
     local_start_slice: usize,
     local_nslices: usize,
     total_fibers_requested: usize,
@@ -144,9 +147,12 @@ fn distribute_fibers_per_slice(
     std_dev: f64,
     max: usize,
     limit: usize,
-    comm: &Comm,
+    comm: &C,
     slice_rng: &mut SliceRng,
-) -> (Vec<usize>, Vec<Vec<usize>>) {
+) -> (Vec<usize>, Vec<Vec<usize>>)
+where
+    C: AnyCommunicator,
+{
     let count_distr = CountDistribution::new(mean, std_dev, max);
 
     // Generate the fiber counts per slice
@@ -176,7 +182,7 @@ fn distribute_fibers_per_slice(
 /// Distribute nonzero indices per fiber.
 ///
 /// This also does an allreduce to ensure that the counts matches the desired amount.
-fn distribute_nnzs_per_fiber(
+fn distribute_nnzs_per_fiber<C>(
     local_start_slice: usize,
     local_nslices: usize,
     count_fibers_per_slice: &[usize],
@@ -186,9 +192,12 @@ fn distribute_nnzs_per_fiber(
     std_dev: f64,
     max: usize,
     limit: usize,
-    comm: &Comm,
+    comm: &C,
     slice_rng: &mut SliceRng,
-) -> (Vec<usize>, Vec<Vec<usize>>) {
+) -> (Vec<usize>, Vec<Vec<usize>>)
+where
+    C: AnyCommunicator,
+{
     let count_distr = CountDistribution::new(mean, std_dev, max);
 
     // Generate the counts
@@ -231,9 +240,12 @@ fn distribute_nnzs_per_fiber(
 /// Based on the following paper:
 ///
 /// Torun et al. A Sparse Tensor Generator with Efficient Feature Extraction. 2025.
-pub fn gentensor(tensor_opts: TensorOptions, comm: &Comm) -> (Vec<Vec<usize>>, Vec<f64>) {
-    let size = comm.size();
-    let rank = comm.rank();
+pub fn gentensor<C>(tensor_opts: TensorOptions, comm: &C) -> (Vec<Vec<usize>>, Vec<f64>)
+where
+    C: AnyCommunicator
+{
+    let size: usize = comm.size().try_into().expect("failed to convert size");
+    let rank: usize = comm.rank().try_into().expect("failed to convert size");
 
     let slice_count = tensor_opts.dims[0];
     let slices_per_rank = slice_count / size;

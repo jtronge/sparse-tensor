@@ -1,10 +1,10 @@
-use sparse_tensor::synthetic::{TensorOptions, gentensor};
-use sparse_tensor::comm::Environment;
 use std::collections::HashSet;
+use mpi::traits::*;
+use sparse_tensor::synthetic::{TensorOptions, gentensor};
 
 fn main() {
-    let env = unsafe { Environment::init() };
-    let world = env.comm_world();
+    let universe = mpi::initialize().expect("failed to initialize MPI universe");
+    let world = universe.world();
     let size = world.size();
     let rank = world.rank();
     println!("rank {} of {}", rank, size);
@@ -12,7 +12,7 @@ fn main() {
         .expect("failed to read in tensor opts file");
     let opts: TensorOptions = serde_json::from_str(&opts_file_data)
         .expect("failed to parse tensor options");
-    let (co, vals) = gentensor(opts, world);
+    let (co, vals) = gentensor(opts, &world);
     assert_eq!(co[0].len(), vals.len());
     let nnz = vals.len();
 

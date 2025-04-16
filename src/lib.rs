@@ -4,7 +4,6 @@ use std::io::{BufReader, Read};
 use std::str::FromStr;
 
 pub mod synthetic;
-pub mod comm;
 
 pub struct TensorStream<R: BufRead> {
     stream: R,
