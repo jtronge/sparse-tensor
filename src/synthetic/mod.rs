@@ -289,11 +289,26 @@ pub fn gentensor(tensor_opts: TensorOptions, comm: &Comm) -> (Vec<Vec<usize>>, V
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
     for slice in local_start_slice..local_start_slice + local_nslices {
+        // Duplicate tracking set --- this can be done per slice here, since each new
+        // slice has a different space of possible nonzeros.
+        let mut co_set = HashSet::new();
         for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
             for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
-                co[0].push(slice);
-                co[1].push(fiber_indices[slice - local_start_slice][fiber]);
-                co[2].push(nonzero_indices[fiber_nnz_idx][k]);
+                let mut tmp_co = vec![];
+                tmp_co.push(slice);
+                tmp_co.push(fiber_indices[slice - local_start_slice][fiber]);
+                tmp_co.push(nonzero_indices[fiber_nnz_idx][k]);
+
+                // Skip duplicates
+                if co_set.contains(&tmp_co) {
+                    continue;
+                }
+                co_set.insert(tmp_co.to_vec());
+
+                // Add the nonzero
+                for (i, id) in tmp_co.iter().enumerate() {
+                    co[i].push(*id);
+                }
                 vals.push(value_distr.sample(slice_rng.rng(slice)));
             }
             fiber_nnz_idx += 1;
