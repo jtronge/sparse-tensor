@@ -1,6 +1,6 @@
 SPARSE_TENSOR_LIB = target/release/libsparse_tensor.so
 SPARSE_TENSOR_LIB_NAME = sparse_tensor
-SPARSE_TENSOR_FILES = src/lib.rs src/synthetic.rs
+SPARSE_TENSOR_FILES = src/lib.rs src/synthetic/mod.rs src/synthetic/c_api.rs
 EXAMPLES = examples/ffi_test.c
 EXAMPLE_BINS = $(EXAMPLES:.c=)
 LDFLAGS = -L$(dir $(SPARSE_TENSOR_LIB)) -l$(SPARSE_TENSOR_LIB_NAME) -Wl,-rpath,$(shell realpath $(dir $(SPARSE_TENSOR_LIB)))
