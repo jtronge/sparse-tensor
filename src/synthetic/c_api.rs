@@ -1,10 +1,11 @@
 //! C API submodule for the sparse tensor generator.
 use std::os::raw::{c_char, c_void};
 use std::ffi::CStr;
+use std::mem::MaybeUninit;
 use std::alloc::{alloc, dealloc, Layout};
 use mpi::topology::SimpleCommunicator;
 use mpi::raw::FromRaw;
-use mpi::ffi::MPI_Comm;
+use mpi::ffi::{MPI_Comm, MPI_Comm_dup};
 
 use crate::synthetic::{TensorOptions, gentensor};
 
@@ -43,7 +44,13 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
 ) -> *mut SyntheticTensor {
     let tensor_opts = opts_handle as *mut TensorOptions;
 
-    let (co, vals) = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(comm));
+    // We have to duplicate the communicator due to RSMPI trying to call
+    // MPI_Comm_free() on it (see https://github.com/rsmpi/rsmpi/issues/32)
+    let mut tmp_comm = MaybeUninit::uninit();
+    MPI_Comm_dup(comm, tmp_comm.as_mut_ptr());
+    let tmp_comm = tmp_comm.assume_init();
+
+    let (co, vals) = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(tmp_comm));
 
     // Some ugly manual mem to work properly with C
     assert_eq!(co[0].len(), vals.len());
