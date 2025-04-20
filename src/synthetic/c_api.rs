@@ -78,7 +78,6 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sparse_tensor_synthetic_free(stensor: *mut SyntheticTensor) {
-    println!("freeing tensor....");
     let stensor = Box::from_raw(stensor);
     let nnz = stensor.nnz;
     let val_layout = Layout::array::<f64>(nnz)

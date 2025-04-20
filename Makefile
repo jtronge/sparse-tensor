@@ -23,5 +23,5 @@ install: $(SPARSE_TENSOR_LIB)
 .PHONY: all
 
 clean:
-	cargo clean && rm $(EXAMPLE_BINS)
+	cargo clean && rm -rf $(EXAMPLE_BINS)
 .PHONY: clean
