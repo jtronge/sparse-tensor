@@ -62,61 +62,78 @@ pub fn load_tensor<R: Read>(stream: R) -> BTreeMap<Vec<usize>, f64> {
     tensor_data
 }
 
-pub trait Coordinate {
-    /// Return a coordinate value for the point.
-    fn co(&self, m: usize) -> usize;
+/// Sparse tensor data structure.
+pub struct SparseTensor {
+    /// Tensor values.
+    pub values: Vec<f64>,
 
-    /// Number of modes in a tensor.
-    fn modes(&self) -> usize;
+    /// nmodes x n array of coordinate indices in the tensor.
+    pub co: Vec<Vec<usize>>,
 }
 
-impl Coordinate for Vec<usize> {
-    fn co(&self, m: usize) -> usize {
-        self[m]
+impl SparseTensor {
+    pub fn new(values: Vec<f64>, co: Vec<Vec<usize>>) -> SparseTensor {
+        for co_list in &co {
+            assert_eq!(values.len(), co_list.len());
+        }
+        SparseTensor {
+            values,
+            co,
+        }
     }
 
-    fn modes(&self) -> usize {
-        self.len()
-    }
-}
-
-impl Coordinate for &[usize] {
-    fn co(&self, m: usize) -> usize {
-        self[m]
+    /// Return the number of nonzeros.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.values.len()
     }
 
-    fn modes(&self) -> usize {
-        self.len()
+    /// Return the number of modes.
+    #[inline]
+    pub fn modes(&self) -> usize {
+        self.co.len()
     }
-}
 
-/// Get the dimensions of a tensor using an iterator over the the nonzeros
-pub fn get_tensor_dims_iter<C>(tensor_iter: impl Iterator<Item = (C, f64)>) -> Vec<usize>
-where
-    C: Coordinate,
-{
-    let mut tensor_dims = vec![];
-    for (i, (co, _)) in tensor_iter.enumerate() {
-        if i == 0 {
-            for m in 0..co.modes() {
-                tensor_dims.push(co.co(m));
+    /// Return the dimensions of the tensor.
+    pub fn tensor_dims(&self) -> Vec<usize> {
+        let mut tensor_dims = vec![];
+        for i in 0..self.values.len() {
+            if i == 0 {
+                for m in 0..self.modes() {
+                    tensor_dims.push(self.co[m][i]);
+                }
+            }
+            for m in 0..self.modes() {
+                tensor_dims[m] = std::cmp::max(tensor_dims[m], self.co[m][i]);
             }
         }
-        assert_eq!(co.modes(), tensor_dims.len());
-        for m in 0..co.modes() {
-            tensor_dims[m] = std::cmp::max(tensor_dims[m], co.co(m));
+        for m in 0..tensor_dims.len() {
+            tensor_dims[m] += 1;
+        }
+        assert_eq!(tensor_dims.len(), self.modes());
+        tensor_dims
+    }
+
+    /// Sort the nonzeros by the values of a specific mode.
+    pub fn sort_by_mode(&mut self, mode: usize) {
+        let mut perm: Vec<usize> = (0..self.count()).collect();
+        perm.sort_by_key(|&i| self.co[mode][i]);
+        for i in 0..self.count() {
+            // Follow the previous permutations made
+            let mut dest = perm[i];
+            while dest < i {
+                dest = perm[dest];
+            }
+            for m in 0..self.modes() {
+                let tmp = self.co[m][i];
+                self.co[m][i] = self.co[m][dest];
+                self.co[m][dest] = tmp;
+            }
+            let tmp = self.values[i];
+            self.values[i] = self.values[dest];
+            self.values[dest] = tmp;
         }
     }
-    for m in 0..tensor_dims.len() {
-        tensor_dims[m] += 1;
-    }
-    assert!(tensor_dims.len() > 0);
-    tensor_dims
-}
-
-/// Get the dimensions of the tensor.
-pub fn get_tensor_dims(tensor_data: &BTreeMap<Vec<usize>, f64>) -> Vec<usize> {
-    get_tensor_dims_iter(tensor_data.iter().map(|(co, value)| (&co[..], *value)))
 }
 
 /// Return a string for representing the dimensions.
@@ -137,7 +154,7 @@ pub fn format_dims(tensor_dims: &[usize]) -> String {
 /// slice_sizes[mode][slice] is the number of nonzeros for the indexed mode
 /// and slice.
 pub fn count_nonzeros_per_slice(
-    tensor_data: &BTreeMap<Vec<usize>, f64>,
+    tensor: &SparseTensor,
     tensor_dims: &[usize],
 ) -> Vec<Vec<usize>> {
     let mut slice_sizes = vec![];
@@ -145,9 +162,9 @@ pub fn count_nonzeros_per_slice(
         let sizes: Vec<usize> = (0..tensor_dims[mode]).map(|_| 0).collect();
         slice_sizes.push(sizes);
     }
-    for (co, _) in tensor_data {
-        for mode in 0..co.len() {
-            slice_sizes[mode][co[mode]] += 1;
+    for i in 0..tensor.count() {
+        for mode in 0..tensor.modes() {
+            slice_sizes[mode][tensor.co[mode][i]] += 1;
         }
     }
     slice_sizes

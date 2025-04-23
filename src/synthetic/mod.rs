@@ -11,6 +11,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Serialize, Deserialize};
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
+use crate::SparseTensor;
 
 mod c_api;
 
@@ -240,7 +241,7 @@ where
 /// Based on the following paper:
 ///
 /// Torun et al. A Sparse Tensor Generator with Efficient Feature Extraction. 2025.
-pub fn gentensor<C>(tensor_opts: TensorOptions, comm: &C) -> (Vec<Vec<usize>>, Vec<f64>)
+pub fn gentensor<C>(tensor_opts: TensorOptions, comm: &C) -> SparseTensor
 where
     C: AnyCommunicator
 {
@@ -300,6 +301,8 @@ where
     let mut fiber_nnz_idx = 0;
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
+    let mut local_nnz = 0;
+    let mut duplicates = 0;
     for slice in local_start_slice..local_start_slice + local_nslices {
         // Duplicate tracking set --- this can be done per slice here, since each new
         // slice has a different space of possible nonzeros.
@@ -313,6 +316,7 @@ where
 
                 // Skip duplicates
                 if co_set.contains(&tmp_co) {
+                    duplicates += 1;
                     continue;
                 }
                 co_set.insert(tmp_co.to_vec());
@@ -325,6 +329,8 @@ where
             }
             fiber_nnz_idx += 1;
         }
+        local_nnz += co_set.len();
     }
-    (co, vals)
+    println!("(rank = {}) local_nnz={},duplicates={}", rank, local_nnz, duplicates);
+    SparseTensor::new(vals, co)
 }

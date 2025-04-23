@@ -50,7 +50,9 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
     MPI_Comm_dup(comm, tmp_comm.as_mut_ptr());
     let tmp_comm = tmp_comm.assume_init();
 
-    let (co, vals) = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(tmp_comm));
+    let tensor = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(tmp_comm));
+    let co = tensor.co;
+    let vals = tensor.values;
 
     // Some ugly manual mem to work properly with C
     assert_eq!(co[0].len(), vals.len());

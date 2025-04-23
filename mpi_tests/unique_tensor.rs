@@ -4,7 +4,7 @@ use mpi::datatype::PartitionMut;
 use mpi::Count;
 use std::collections::BTreeMap;
 use sparse_tensor::synthetic::{TensorOptions, gentensor};
-use sparse_tensor::feat;
+use sparse_tensor::{SparseTensor, feat};
 
 fn main() {
     let universe = mpi::initialize().expect("failed to initialize MPI universe");
@@ -15,7 +15,9 @@ fn main() {
         .expect("failed to read in tensor opts file");
     let opts: TensorOptions = serde_json::from_str(&opts_file_data)
         .expect("failed to parse tensor options");
-    let (co, vals) = gentensor(opts, &world);
+    let tensor = gentensor(opts, &world);
+    let co = tensor.co;
+    let vals = tensor.values;
     assert_eq!(co[0].len(), vals.len());
     let nmodes = co.len();
     let nnz = vals.len();
@@ -55,18 +57,8 @@ fn main() {
         let mut partition = PartitionMut::new(&mut complete_vals[..], &counts[..], &disps[..]);
         root.gather_varcount_into_root(&vals, &mut partition);
 
-        // Convert the tensor into a BTreeMap
-        let mut tensor_data = BTreeMap::new();
-        while complete_vals.len() > 0 {
-            let mut new_co = vec![];
-            for m in 0..nmodes {
-                new_co.push(complete_co[m].pop().expect("missing coordinate"));
-                complete_co[m].shrink_to_fit();
-            }
-            tensor_data.insert(new_co, complete_vals.pop().expect("missing value"));
-            complete_vals.shrink_to_fit();
-        }
-        feat::analyze_tensor(&tensor_data);
+        // let complete_tensor = SparseTensor::new(complete_vals, complete_co);
+        // feat::analyze_tensor(&complete_tensor);
     } else {
         root.gather_into(&nnz);
         for m in 0..nmodes {

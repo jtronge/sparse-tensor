@@ -1,8 +1,10 @@
 //! Tensor feature analysis and helping library.
-use std::collections::BTreeMap;
+use std::collections::{HashSet, HashMap};
+use mpi::Count;
+use mpi::datatype::{Partition, PartitionMut};
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
-use crate::{Coordinate, get_tensor_dims, get_tensor_dims_iter};
+use crate::{SparseTensor, format_dims};
 
 /// Calculate and return the mean and standard deviation of an array of counts.
 pub fn calculate_mean_std_dev(counts: &[usize]) -> (f64, f64) {
@@ -15,57 +17,337 @@ pub fn calculate_mean_std_dev(counts: &[usize]) -> (f64, f64) {
     (mean, std_dev)
 }
 
-pub fn analyze_tensor(tensor: &BTreeMap<Vec<usize>, f64>) {
-    let dims = get_tensor_dims(tensor);
-    assert_eq!(dims.len(), 3);
-
-    // Organize into slices
-    let mut slices = vec![vec![]; dims[0]];
-    for (co, _) in tensor {
-        slices[co[0]].push(co.to_vec());
-    }
-    println!("nnz: {}", tensor.len());
-    println!("density: {:e}", (tensor.len() as f64 / dims.iter().product::<usize>() as f64));
-
-    // Get properties for each slice
-    let mut nonzero_fibers_per_slice = vec![];
-    let mut square_nnz_per_fiber_sum = 0;
-    for i in 0..dims[0] {
-        // X(i, :, k) fibers
-        let mut fibers = vec![0; dims[2]];
-        for co in &slices[i] {
-            fibers[co[2]] += 1;
+/// Determine the owner of a slice.
+fn determine_owner(first_slices: &[usize], slice: usize) -> usize {
+    for i in 0..first_slices.len() {
+        if slice >= first_slices[i] && slice < first_slices[i+1] {
+            return i;
         }
-        square_nnz_per_fiber_sum += fibers.iter().map(|count| count * count).sum::<usize>();
-        let nonzero_fibers: usize = fibers.iter().map(|count| if *count > 0 { 1 } else { 0 }).sum();
-        nonzero_fibers_per_slice.push(nonzero_fibers);
     }
-    // Nonzero per fiber properties (X(i, :, k) fibers)
-    let nnz_per_fiber_mean = tensor.len() as f64 / (dims[0] * dims[2]) as f64;
-    let nnz_per_fiber_std_dev = (square_nnz_per_fiber_sum as f64 / tensor.len() as f64
-                                 - nnz_per_fiber_mean * nnz_per_fiber_mean).sqrt();
-    println!("nnz_per_fiber_mean: {:e}", nnz_per_fiber_mean);
-    println!("nnz_per_fiber_std_dev: {}", nnz_per_fiber_std_dev);
-    // Coefficient of variation
-    println!("nnz_per_fiber_cv: {}", nnz_per_fiber_std_dev / nnz_per_fiber_mean);
-    // Fiber per slice properties
-    let fibers_per_slice_max = *nonzero_fibers_per_slice.iter().max().expect("missing maximum value");
-    println!("fiber_density: {:e}", nonzero_fibers_per_slice.iter().sum::<usize>() as f64 / (dims[0] * dims[2]) as f64);
-    let (fibers_per_slice_mean, fibers_per_slice_std_dev) = calculate_mean_std_dev(&nonzero_fibers_per_slice);
-    println!("## statistics for X(i, :, k) fibers");
-    println!("fibers_per_slice_mean: {:.4}", fibers_per_slice_mean);
-    println!("fibers_per_slice_std_dev: {:.4}", fibers_per_slice_std_dev);
-    // Coefficient of variation
-    println!("fibers_per_slice_cv: {:.4}", fibers_per_slice_std_dev / fibers_per_slice_mean);
-    // Imbalance calculated as (max - average) / max
-    let fibers_per_slice_imbalance = (fibers_per_slice_max as f64 - fibers_per_slice_mean) / fibers_per_slice_max as f64;
-    println!("fibers_per_slice_imbalance: {:.4}", fibers_per_slice_imbalance);
+    // Just return the last rank
+    return first_slices.len() - 1;
 }
 
-pub fn analyze_tensor_parallel<P, C>(tensor_iter: impl Iterator<Item = (C, f64)> + Clone, comm: &P)
+/// Redistribute the input tensor across ranks using a 1D distribution.
+fn redistribute_1d<C>(
+    tensor: &SparseTensor,
+    dims: &[usize],
+    distribute_mode: usize,
+    comm: &C,
+) -> SparseTensor
+where
+    C: AnyCommunicator,
+{
+    // Determine number of slices per rank in the 1D decomposition
+    let size: usize = comm.size().try_into().expect("failed to convert communicator size to usize");
+    let slice_count = dims[distribute_mode];
+    let slices_per_rank = slice_count / size;
+    let mut first_slices: Vec<usize> = (0..size).map(|rank| {
+        let count = rank * slices_per_rank;
+        if rank == (size - 1) && size > 1 {
+            // Put the remainder on the last rank
+            count + slice_count % rank
+        } else {
+            count
+        }
+    }).collect();
+    first_slices.push(slice_count);
+
+    // Go through my local nonzeros and determine where they need to go.
+    let mut owner_to_index = vec![vec![]; size];
+    let mut send_counts: Vec<Count> = vec![0; size];
+    for i in 0..tensor.count() {
+        let owner = determine_owner(&first_slices[..], tensor.co[distribute_mode][i]);
+        owner_to_index[owner].push(i);
+        send_counts[owner] += 1;
+    }
+    let mut nnzs_to_send = vec![vec![]; tensor.modes()];
+    let mut values_to_send = vec![];
+    let mut send_disps: Vec<Count> = vec![0];
+    for rank in 0..size {
+        for m in 0..tensor.modes() {
+            for i in &owner_to_index[rank] {
+                nnzs_to_send[m].push(tensor.co[m][*i]);
+            }
+        }
+        for i in &owner_to_index[rank] {
+            values_to_send.push(tensor.values[*i]);
+        }
+        if rank > 0 {
+            send_disps.push(send_disps[rank - 1] + send_counts[rank - 1]);
+        }
+    }
+    let mut recv_counts: Vec<Count> = vec![0; size];
+    comm.all_to_all_into(&send_counts[..], &mut recv_counts[..]);
+    let mut recv_disps: Vec<Count> = vec![0];
+    for rank in 1..size {
+        recv_disps.push(recv_disps[rank - 1] + recv_counts[rank - 1]);
+    }
+    let total_recv: usize = (recv_disps[recv_disps.len() - 1]
+                             + recv_counts[recv_counts.len() - 1])
+        .try_into().expect("failed to convert i32 to usize");
+
+    let mut recv_co = vec![];
+    for m in 0..tensor.modes() {
+        let send_buffer = Partition::new(&nnzs_to_send[m][..], &send_counts[..], &send_disps[..]);
+        let mut tmp_buf = vec![0; total_recv];
+        let mut recv_buffer = PartitionMut::new(&mut tmp_buf[..], &recv_counts[..], &recv_disps[..]);
+        comm.all_to_all_varcount_into(&send_buffer, &mut recv_buffer);
+        recv_co.push(tmp_buf);
+    }
+
+    let mut recv_vals = vec![0.0; total_recv];
+    let send_buffer = Partition::new(&values_to_send[..], &send_counts[..], &send_disps[..]);
+    let mut recv_buffer = PartitionMut::new(&mut recv_vals[..], &recv_counts[..], &recv_disps[..]);
+    comm.all_to_all_varcount_into(&send_buffer, &mut recv_buffer);
+
+    SparseTensor::new(recv_vals, recv_co)
+}
+
+/// Sort the tensor entries by mode and compute the slice pointers.
+fn sort_compute_slice_ptrs(local_tensor: &mut SparseTensor) -> Vec<usize> {
+    local_tensor.sort_by_mode(0);
+    let mut slice_ptrs = vec![0];
+    if local_tensor.count() > 0 {
+        let mut last_slice = local_tensor.co[0][0];
+        for i in 1..local_tensor.count() {
+            let mut j = last_slice;
+            while j != local_tensor.co[0][i] {
+                slice_ptrs.push(i);
+                j += 1;
+            }
+            last_slice = local_tensor.co[0][i];
+        }
+    }
+    slice_ptrs.push(local_tensor.count());
+    slice_ptrs
+}
+
+/// Abstraction for analyzing a tensor.
+struct Analysis {
+    /// The sparse tensor data (local only).
+    local_tensor: SparseTensor,
+
+    /// Global dimensions of the tensor.
+    global_dims: Vec<usize>,
+
+    /// Global number of nonzeros.
+    global_nnz: usize,
+
+    /// Local slice pointers (as with a CSF).
+    local_slice_ptrs: Vec<usize>,
+
+    /// Local start slice.
+    local_start_slice: usize,
+
+    /// Local slice count.
+    local_slice_count: usize,
+}
+
+impl Analysis {
+    fn new(mut local_tensor: SparseTensor, global_dims: Vec<usize>, global_nnz: usize) -> Analysis {
+        let local_slice_ptrs = sort_compute_slice_ptrs(&mut local_tensor);
+
+        // Compute the slice bounds.
+        let (local_start_slice, local_slice_count) = if local_tensor.count() > 0 {
+            let local_first_slice = *local_tensor.co[0]
+                .iter()
+                .min()
+                .expect("failed to get minimum slice");
+            let max_slice_val = local_tensor.co[0]
+                .iter()
+                .max()
+                .expect("failed to get maximum slice");
+            let local_slice_count = max_slice_val - local_first_slice + 1;
+            (local_first_slice, local_slice_count)
+        } else {
+            (0, 0)
+        };
+
+        Analysis {
+            local_tensor,
+            global_dims,
+            global_nnz,
+            local_slice_ptrs,
+            local_start_slice,
+            local_slice_count,
+        }
+    }
+
+    /// Calculate properties of fibers per each slice globally.
+    fn calculate_fibers_per_slice_props<C: AnyCommunicator>(&self, comm: &C) -> (f64, f64, f64, f64) {
+        let mut fiber_count = 0;
+        let mut fibers_per_slice_square = 0;
+        let mut fibers_per_slice_max = 0;
+        // Iterate over each slice
+        for i in 0..self.local_slice_ptrs.len()-1 {
+            // These are the X(i, :, k) fibers
+            // Count number of nonzeros in each fiber
+            let mut nonzero_fibers = HashSet::new();
+            // Now iterate over every nonzero within the slice
+            for j in self.local_slice_ptrs[i]..self.local_slice_ptrs[i+1] {
+                let fiber_idx = self.local_tensor.co[2][j];
+                if !nonzero_fibers.contains(&fiber_idx) {
+                    nonzero_fibers.insert(fiber_idx);
+                }
+            }
+            fiber_count += nonzero_fibers.len();
+            fibers_per_slice_square += nonzero_fibers.len() * nonzero_fibers.len();
+            fibers_per_slice_max = std::cmp::max(fibers_per_slice_max, nonzero_fibers.len());
+        }
+
+        let mut global_fiber_count = 0;
+        comm.all_reduce_into(
+            &fiber_count,
+            &mut global_fiber_count,
+            SystemOperation::sum(),
+        );
+        let mut global_fibers_per_slice_square = 0;
+        comm.all_reduce_into(
+            &fibers_per_slice_square,
+            &mut global_fibers_per_slice_square,
+            SystemOperation::sum(),
+        );
+        let mut global_fibers_per_slice_max = 0;
+        comm.all_reduce_into(
+            &fibers_per_slice_max,
+            &mut global_fibers_per_slice_max,
+            SystemOperation::max(),
+        );
+
+        let global_fibers_per_slice_density = global_fiber_count as f64
+                                              / (self.global_dims[0] * self.global_dims[2]) as f64;
+        let global_fibers_per_slice_mean = global_fiber_count as f64 / self.global_dims[0] as f64;
+        let global_fibers_per_slice_std_dev = (global_fibers_per_slice_square as f64 / self.global_dims[0] as f64
+                                               - global_fibers_per_slice_mean * global_fibers_per_slice_mean).sqrt();
+        // Imbalance calculated as (max - average) / max
+        let global_fibers_per_slice_imbalance = (global_fibers_per_slice_max as f64
+                                                 - global_fibers_per_slice_mean)
+                                                 / global_fibers_per_slice_max as f64;
+        (
+            global_fibers_per_slice_density,
+            global_fibers_per_slice_mean,
+            global_fibers_per_slice_std_dev,
+            global_fibers_per_slice_imbalance,
+        )
+    }
+
+    /// Calculate properties of nonzeros per each fiber globally.
+    fn calculate_nnzs_per_fiber_props<C: AnyCommunicator>(&self, comm: &C) -> (f64, f64, f64) {
+        let mut nnz_total = 0;
+        let mut nnz_per_fiber_square = 0;
+        let mut nnz_per_fiber_max = 0;
+        // Iterate over each slice
+        for i in 0..self.local_slice_ptrs.len()-1 {
+            // These are the X(i, :, k) fibers
+            let mut nonzero_fibers = HashMap::new();
+            // Now iterate over every nonzero within the slice
+            for j in self.local_slice_ptrs[i]..self.local_slice_ptrs[i+1] {
+                let fiber_idx = self.local_tensor.co[2][j];
+                let nnz_idx = self.local_tensor.co[1][j];
+                if let Some(count) = nonzero_fibers.get_mut(&fiber_idx) {
+                    *count += 1;
+                } else {
+                    nonzero_fibers.insert(fiber_idx, 1);
+                }
+            }
+            nnz_total += nonzero_fibers
+                .iter()
+                .map(|(_, &count)| count)
+                .sum::<usize>();
+            nnz_per_fiber_square += nonzero_fibers
+                .iter()
+                .map(|(_, &count)| count * count)
+                .sum::<usize>();
+            let max_now = nonzero_fibers
+                .iter()
+                .map(|(_, &count)| count)
+                .max()
+                .expect("failed to get max number of nnzs in a slice");
+            nnz_per_fiber_max = std::cmp::max(nnz_per_fiber_max, max_now);
+        }
+
+        let mut global_nnz = 0;
+        comm.all_reduce_into(
+            &nnz_total,
+            &mut global_nnz,
+            SystemOperation::sum(),
+        );
+        assert_eq!(global_nnz, self.global_nnz);
+        let mut global_nnz_per_fiber_square = 0;
+        comm.all_reduce_into(
+            &nnz_per_fiber_square,
+            &mut global_nnz_per_fiber_square,
+            SystemOperation::sum(),
+        );
+        assert!(global_nnz_per_fiber_square > global_nnz);
+        let mut global_nnz_per_fiber_max = 0;
+        comm.all_reduce_into(
+            &nnz_per_fiber_max,
+            &mut global_nnz_per_fiber_max,
+            SystemOperation::max(),
+        );
+
+        let total_possible_fibers = (self.global_dims[0] * self.global_dims[2]) as f64;
+        let global_nnz_per_fiber_mean = self.global_nnz as f64 / total_possible_fibers;
+        let global_nnz_per_fiber_std_dev = (global_nnz_per_fiber_square as f64 / total_possible_fibers
+                                            - global_nnz_per_fiber_mean * global_nnz_per_fiber_mean).sqrt();
+        let global_nnz_per_fiber_imbalance = (global_nnz_per_fiber_max as f64 - global_nnz_per_fiber_mean)
+                                             / global_nnz_per_fiber_max as f64;
+        (
+            global_nnz_per_fiber_mean,
+            global_nnz_per_fiber_std_dev,
+            global_nnz_per_fiber_imbalance,
+        )
+    }
+}
+
+pub fn analyze_tensor<C>(tensor: &SparseTensor, comm: &C)
+where
+    C: AnyCommunicator,
+{
+    let rank = comm.rank();
+
+    // First determine the global dimensions of the tensor across all ranks.
+    let local_dims = tensor.tensor_dims();
+    let mut dims = vec![0; local_dims.len()];
+    comm.all_reduce_into(&local_dims, &mut dims, SystemOperation::max());
+
+    // Redistribute the tensor using a 1D distribution across the ranks.
+    let mut local_tensor = redistribute_1d(tensor, &dims[..], 0, comm);
+
+    let local_nnz = local_tensor.count();
+    let mut global_nnz = 0;
+    comm.all_reduce_into(&local_nnz, &mut global_nnz, SystemOperation::sum());
+
+    let analysis = Analysis::new(local_tensor, dims, global_nnz);
+
+    // Compute fibers per slice properties
+    let (fps_density, fps_mean, fps_std_dev, fps_imbalance) = analysis.calculate_fibers_per_slice_props(comm);
+    // Compute nnzs per fiber properties
+    let (npf_mean, npf_std_dev, npf_imbalance) = analysis.calculate_nnzs_per_fiber_props(comm);
+
+    if rank == 0 {
+        println!("dims: {}", format_dims(&analysis.global_dims[..]));
+        println!("nnzs: {}", analysis.global_nnz);
+        println!("density: {:e}", analysis.global_nnz as f64 / analysis.global_dims.iter().product::<usize>() as f64);
+        println!("fiber_density: {:e}", fps_density);
+        println!("fibers_per_slice_mean: {}", fps_mean);
+        println!("fibers_per_slice_std_dev: {}", fps_std_dev);
+        println!("fibers_per_slice_cv: {}", fps_std_dev / fps_mean);
+        println!("fibers_per_slice_imbalance: {}", fps_imbalance);
+        println!("nnz_per_fiber_mean: {}", npf_mean);
+        println!("nnz_per_fiber_std_dev: {}", npf_std_dev);
+        println!("nnz_per_fiber_cv: {}", npf_std_dev / npf_mean);
+        println!("nnz_per_fiber_imbalance: {}", npf_imbalance);
+    }
+}
+
+/*
+pub fn analyze_tensor_parallel<P, E>(tensor_iter: impl Iterator<Item = E> + Clone, comm: &P)
 where
     P: AnyCommunicator,
-    C: Coordinate,
+    E: Entry,
 {
     let local_dims = get_tensor_dims_iter(tensor_iter.clone());
     assert_eq!(local_dims.len(), 3);
@@ -75,8 +357,8 @@ where
     // Organize into slices
     let mut slices: Vec<Vec<Vec<usize>>> = vec![vec![]; dims[0]];
     let mut nnz = 0;
-    for (co, _) in tensor_iter.clone() {
-        slices[co.co(0)].push((0..co.modes()).map(|i| co.co(i)).collect());
+    for entry in tensor_iter.clone() {
+        slices[entry.co(0)].push((0..entry.modes()).map(|i| entry.co(i)).collect());
         nnz += 1;
     }
     println!("nnz: {}", nnz);
@@ -116,3 +398,4 @@ where
     let fibers_per_slice_imbalance = (fibers_per_slice_max as f64 - fibers_per_slice_mean) / fibers_per_slice_max as f64;
     println!("fibers_per_slice_imbalance: {:.4}", fibers_per_slice_imbalance);
 }
+*/
