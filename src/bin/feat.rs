@@ -3,6 +3,7 @@
 //! Partially based on https://arxiv.org/abs/2405.04944
 use std::fs::File;
 use std::io::BufReader;
+use std::time::Instant;
 use mpi::traits::*;
 use sparse_tensor::{feat, TensorStream, SparseTensor};
 
@@ -17,6 +18,7 @@ fn main() {
     let mut local_co = vec![vec![]; 3];
     let mut local_values = vec![];
     if rank == 0 {
+        let io_timer = Instant::now();
         let args: Vec<String> = std::env::args().map(|arg| arg.to_string()).collect();
         assert_eq!(args.len(), 2);
         let tensor_fname = &args[1];
@@ -67,6 +69,7 @@ fn main() {
         for rank in 1..size {
             world.process_at_rank(rank).send(&0);
         }
+        println!("io took {:.4} seconds", io_timer.elapsed().as_secs_f64());
     } else {
         let root = world.process_at_rank(0);
         loop {
