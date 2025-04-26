@@ -4,6 +4,7 @@
 //! Extraction. 2025.
 use std::collections::HashSet;
 use std::os::raw::c_int;
+use std::time::Instant;
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
 use rand_chacha::rand_core::SeedableRng;
@@ -248,6 +249,10 @@ where
     let size: usize = comm.size().try_into().expect("failed to convert size");
     let rank: usize = comm.rank().try_into().expect("failed to convert size");
 
+    let now = Instant::now();
+    if rank == 0 {
+        println!("==> starting sparse_tensor generator");
+    }
     let slice_count = tensor_opts.dims[0];
     let slices_per_rank = slice_count / size;
     let local_start_slice = rank * slices_per_rank;
@@ -302,21 +307,31 @@ where
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
     let mut local_nnz = 0;
-    let mut duplicates = 0;
     for slice in local_start_slice..local_start_slice + local_nslices {
         // Duplicate tracking set --- this can be done per slice here, since each new
         // slice has a different space of possible nonzeros.
         let mut co_set = HashSet::new();
+        // Uniform generator in case of duplicates
+        let nnz_distr = Uniform::new(0, tensor_opts.dims[2] - 1)
+            .expect("failed to create uniform distribution");
         for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
+            let fiber_idx = fiber_indices[slice - local_start_slice][fiber];
             for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
                 let mut tmp_co = vec![];
                 tmp_co.push(slice);
-                tmp_co.push(fiber_indices[slice - local_start_slice][fiber]);
+                // TODO: Shouldn't these be switched?
+                tmp_co.push(fiber_idx);
                 tmp_co.push(nonzero_indices[fiber_nnz_idx][k]);
 
-                // Skip duplicates
+                // Generate a new coordinate if we have a duplicate
+                let mut attempts = 0;
+                while co_set.contains(&tmp_co) && attempts < 8 {
+                    tmp_co.pop();
+                    tmp_co.push(nnz_distr.sample(slice_rng.rng(slice)));
+                    attempts += 1;
+                }
                 if co_set.contains(&tmp_co) {
-                    duplicates += 1;
+                    // Give up, we can't find another coordinate
                     continue;
                 }
                 co_set.insert(tmp_co.to_vec());
@@ -331,6 +346,8 @@ where
         }
         local_nnz += co_set.len();
     }
-    println!("(rank = {}) local_nnz={},duplicates={}", rank, local_nnz, duplicates);
+    if rank == 0 {
+        println!("==> sparse_tensor_generate_time={}s", now.elapsed().as_secs_f64());
+    }
     SparseTensor::new(vals, co)
 }

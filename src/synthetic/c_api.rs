@@ -2,10 +2,12 @@
 use std::os::raw::{c_char, c_void};
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
+use std::time::Instant;
 use std::alloc::{alloc, dealloc, Layout};
 use mpi::topology::SimpleCommunicator;
 use mpi::raw::FromRaw;
 use mpi::ffi::{MPI_Comm, MPI_Comm_dup};
+use mpi::traits::*;
 
 use crate::synthetic::{TensorOptions, gentensor};
 
@@ -50,10 +52,12 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
     MPI_Comm_dup(comm, tmp_comm.as_mut_ptr());
     let tmp_comm = tmp_comm.assume_init();
 
-    let tensor = gentensor((*tensor_opts).clone(), &SimpleCommunicator::from_raw(tmp_comm));
+    let rsmpi_comm = SimpleCommunicator::from_raw(tmp_comm);
+    let tensor = gentensor((*tensor_opts).clone(), &rsmpi_comm);
     let co = tensor.co;
     let vals = tensor.values;
 
+    let now = Instant::now();
     // Some ugly manual mem to work properly with C
     assert_eq!(co[0].len(), vals.len());
     let local_nnz = co[0].len();
@@ -75,6 +79,9 @@ pub unsafe extern "C" fn sparse_tensor_synthetic_generate(
         co: co_ptrs[..].try_into().expect("failed to convert from vec to array in struct"),
         vals: val_ptr as *mut _,
     };
+    if rsmpi_comm.rank() == 0 {
+        println!("==> mem_alloc_time={}", now.elapsed().as_secs_f64());
+    }
     Box::into_raw(Box::new(stensor))
 }
 
