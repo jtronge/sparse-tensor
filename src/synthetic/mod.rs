@@ -313,6 +313,7 @@ where
     let max_fibers_per_slice = tensor_opts.dims[1];
 
     // Compute number and indicies of fibers per slice
+    let fiber_timer = Instant::now();
     let (count_fibers_per_slice, fiber_indices) = distribute_fibers_per_slice(
         local_start_slice,
         local_nslices,
@@ -325,8 +326,12 @@ where
         &mut slice_rng,
     );
     let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
+    if rank == 0 {
+        println!("==> distribute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64());
+    }
 
     // Compute nonzeros per fiber
+    let nnz_timer = Instant::now();
     let mean_nonzeros_per_fiber = nnz as f64 / nonzero_fiber_count as f64;
     let std_dev_nonzeros_per_fiber = tensor_opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
     let max_nonzeros_per_fiber = tensor_opts.dims[2];
@@ -343,7 +348,11 @@ where
         comm,
         &mut slice_rng,
     );
+    if rank == 0 {
+        println!("==> distribute_nnzs_per_fiber_time={}s", nnz_timer.elapsed().as_secs_f64());
+    }
 
+    let set_nnz_timer = Instant::now();
     let value_distr = Uniform::new(0.0, 1.0)
         .expect("failed to create uniform distribution for tensor values");
     let mut fiber_nnz_idx = 0;
@@ -389,9 +398,16 @@ where
         }
         local_nnz += co_set.len();
     }
+    if rank == 0 {
+        println!("==> set_nnz_time={}s", set_nnz_timer.elapsed().as_secs_f64());
+    }
 
     // Check for and remove any empty slices
+    let empty_slice_timer = Instant::now();
     remove_empty_slices(&mut co, comm);
+    if rank == 0 {
+        println!("==> remove_empty_slice_time={}s", empty_slice_timer.elapsed().as_secs_f64());
+    }
 
     if rank == 0 {
         println!("==> sparse_tensor_generate_time={}s", now.elapsed().as_secs_f64());

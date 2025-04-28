@@ -1,5 +1,6 @@
 //! Tensor feature analysis and helping library.
 use std::collections::{HashSet, HashMap};
+use std::time::Instant;
 use mpi::Count;
 use mpi::datatype::{Partition, PartitionMut};
 use mpi::traits::*;
@@ -306,26 +307,56 @@ pub fn analyze_tensor<C>(tensor: &SparseTensor, comm: &C)
 where
     C: AnyCommunicator,
 {
+    let total_timer = Instant::now();
     let rank = comm.rank();
 
     // First determine the global dimensions of the tensor across all ranks.
+    let dim_timer = Instant::now();
     let local_dims = tensor.tensor_dims();
     let mut dims = vec![0; local_dims.len()];
     comm.all_reduce_into(&local_dims, &mut dims, SystemOperation::max());
+    if rank == 0 {
+        println!("==> calculate_dimension_time={}s", dim_timer.elapsed().as_secs_f64());
+    }
 
     // Redistribute the tensor using a 1D distribution across the ranks.
+    let redistribute_timer = Instant::now();
     let mut local_tensor = redistribute_1d(tensor, &dims[..], 0, comm);
+    if rank == 0 {
+        println!("==> redistribute_time={}s", redistribute_timer.elapsed().as_secs_f64());
+    }
 
+    let nnz_timer = Instant::now();
     let local_nnz = local_tensor.count();
     let mut global_nnz = 0;
     comm.all_reduce_into(&local_nnz, &mut global_nnz, SystemOperation::sum());
+    if rank == 0 {
+        println!("==> compute_global_nnz_time={}s", nnz_timer.elapsed().as_secs_f64());
+    }
 
+    let init_timer = Instant::now();
     let analysis = Analysis::new(local_tensor, dims, global_nnz);
+    if rank == 0 {
+        println!("==> struct_init_time={}s", init_timer.elapsed().as_secs_f64());
+    }
 
     // Compute fibers per slice properties
+    let fiber_timer = Instant::now();
     let (fps_density, fps_mean, fps_std_dev, fps_imbalance) = analysis.calculate_fibers_per_slice_props(comm);
+    if rank == 0 {
+        println!("==> compute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64())
+    }
+
     // Compute nnzs per fiber properties
+    let nnz_timer = Instant::now();
     let (npf_mean, npf_std_dev, npf_imbalance) = analysis.calculate_nnzs_per_fiber_props(comm);
+    if rank == 0 {
+        println!("==> compute_nnzs_per_fiber_time={}s", nnz_timer.elapsed().as_secs_f64());
+    }
+
+    if rank == 0 {
+        println!("==> total_time={}s", total_timer.elapsed().as_secs_f64());
+    }
 
     if rank == 0 {
         println!("dims: {}", format_dims(&analysis.global_dims[..]));
