@@ -146,8 +146,15 @@ struct Analysis {
 }
 
 impl Analysis {
-    fn new(mut local_tensor: SparseTensor, global_dims: Vec<usize>, global_nnz: usize) -> Analysis {
+    fn new<C>(mut local_tensor: SparseTensor, global_dims: Vec<usize>, global_nnz: usize, comm: &C) -> Analysis
+    where
+        C: AnyCommunicator,
+    {
+        let sort_slice_timer = Instant::now();
         let local_slice_ptrs = sort_compute_slice_ptrs(&mut local_tensor);
+        if comm.rank() == 0 {
+            println!("==> sort_slice_time={}s", sort_slice_timer.elapsed().as_secs_f64());
+        }
 
         // Compute the slice bounds.
         let (local_start_slice, local_slice_count) = if local_tensor.count() > 0 {
@@ -334,11 +341,7 @@ where
         println!("==> compute_global_nnz_time={}s", nnz_timer.elapsed().as_secs_f64());
     }
 
-    let init_timer = Instant::now();
-    let analysis = Analysis::new(local_tensor, dims, global_nnz);
-    if rank == 0 {
-        println!("==> struct_init_time={}s", init_timer.elapsed().as_secs_f64());
-    }
+    let analysis = Analysis::new(local_tensor, dims, global_nnz, comm);
 
     // Compute fibers per slice properties
     let fiber_timer = Instant::now();
