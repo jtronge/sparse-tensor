@@ -237,6 +237,48 @@ where
     (nnz_counts, nnz_inds)
 }
 
+/// Remove empty slices from the tensor coordinates.
+fn remove_empty_slices<C: AnyCommunicator>(co: &mut [Vec<usize>], comm: &C) {
+    for m in 0..3 {
+        let local_max_dim = co[m].iter().max().expect("missing max value") + 1;
+        let mut max_dim: usize = 0;
+        comm.all_reduce_into(&local_max_dim, &mut max_dim, SystemOperation::max());
+
+        // Count local indices
+        let mut local_nnz_counts = vec![0; max_dim];
+        for co_val in &co[m] {
+            local_nnz_counts[*co_val] += 1;
+        }
+
+        // First compute empty slices by setting the count of nnzs in
+        // index_updates, then use this to update the indices to remove empty
+        // slices.
+        let mut global_nnz_counts = vec![0; max_dim];
+        comm
+            .process_at_rank(0)
+            .all_reduce_into(
+                &local_nnz_counts,
+                &mut global_nnz_counts,
+                SystemOperation::sum(),
+            );
+        // Compute the amount to shift every index over by to remove the empty
+        // slices.
+        let shifts: Vec<usize> = global_nnz_counts
+            .iter()
+            .map(|&count| if count == 0 { 1 } else { 0 })
+            .scan(0, |state, count| {
+                *state += count;
+                Some(*state)
+            })
+            .collect();
+
+        // Now remove the slices
+        for co_val in &mut co[m] {
+            *co_val -= shifts[*co_val];
+        }
+    }
+}
+
 /// Generate a tensor based on the input metrics.
 ///
 /// Based on the following paper:
@@ -302,7 +344,8 @@ where
         &mut slice_rng,
     );
 
-    let value_distr = Uniform::new(0.0, 1.0).expect("failed to create uniform distribution for tensor values");
+    let value_distr = Uniform::new(0.0, 1.0)
+        .expect("failed to create uniform distribution for tensor values");
     let mut fiber_nnz_idx = 0;
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
@@ -346,6 +389,10 @@ where
         }
         local_nnz += co_set.len();
     }
+
+    // Check for and remove any empty slices
+    remove_empty_slices(&mut co, comm);
+
     if rank == 0 {
         println!("==> sparse_tensor_generate_time={}s", now.elapsed().as_secs_f64());
     }
