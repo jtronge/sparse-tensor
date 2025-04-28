@@ -1,6 +1,0 @@
-==> starting sparse_tensor generator
-==> distribute_fibers_per_slice_time=4.022839178s
-==> distribute_nnzs_per_fiber_time=25.235401415s
-==> set_nnz_time=3.046006907s
-==> remove_empty_slice_time=1.5864887909999998s
-==> sparse_tensor_generate_time=33.921169421s
