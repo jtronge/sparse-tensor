@@ -2,9 +2,7 @@ use std::collections::HashSet;
 use mpi::traits::*;
 use mpi::datatype::PartitionMut;
 use mpi::Count;
-use std::collections::BTreeMap;
 use sparse_tensor::synthetic::{TensorOptions, gentensor};
-use sparse_tensor::{SparseTensor, feat};
 
 fn main() {
     let universe = mpi::initialize().expect("failed to initialize MPI universe");
@@ -24,7 +22,6 @@ fn main() {
 
     // Check that every nonzero is unique
     let mut co_set = HashSet::new();
-    let mut nonunique_count = 0;
     for i in 0..nnz {
         let ids: Vec<usize> = (0..3).map(|j| co[j][i]).collect();
         if !co_set.contains(&ids[..]) {

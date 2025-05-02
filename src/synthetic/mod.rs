@@ -13,6 +13,8 @@ use serde::{Serialize, Deserialize};
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
 use crate::SparseTensor;
+use rayon::prelude::*;
+use rayon_scan::ScanParallelIterator;
 
 mod c_api;
 
@@ -38,10 +40,20 @@ pub struct TensorOptions {
 }
 
 /// Return n indices each uniformly distributed from [0, limit)
-fn randinds<R: Rng>(n: usize, limit: usize, rng: &mut R) -> Vec<usize> {
-    assert!(limit > 0);
+fn randinds<R: Rng>(n: usize, limit: usize, index_check: &mut [bool], rng: &mut R) -> Vec<usize> {
+    assert_eq!(index_check.len(), limit);
+    index_check.fill(false);
     let distr = Uniform::new(0, limit - 1).expect("failed to create uniform distribution");
-    (0..n).map(|_| distr.sample(rng)).collect()
+    let mut inds = vec![];
+    for _ in 0..n {
+        let i = distr.sample(rng);
+        if index_check[i] {
+            continue;
+        }
+        index_check[i] = true;
+        inds.push(i);
+    }
+    inds
 }
 
 /// Random distribution for counts (number of slices, fibers, nonzeros, etc.).
@@ -167,6 +179,7 @@ where
 
     // Now generate random indices for the fibers
     let mut fiber_inds = vec![];
+    let mut index_check = vec![false; limit];
     for (slice, fiber_count) in (local_start_slice..local_start_slice + local_nslices).zip(fcounts_per_slice.iter_mut()) {
         *fiber_count = std::cmp::min(*fiber_count, max);
         // I've noticed that setting the count to 1, if it is zero, can triple
@@ -175,7 +188,9 @@ where
 
         // Create an array of size fcounts_per_slice[slice] all in the range [1, limit] ---
         // this is done with a uniform distribution here
-        fiber_inds.push(randinds(*fiber_count, limit, slice_rng.rng(slice)));
+        let inds = randinds(*fiber_count, limit, &mut index_check[..], slice_rng.rng(slice));
+        *fiber_count = inds.len();
+        fiber_inds.push(inds);
     }
 
     (fcounts_per_slice, fiber_inds)
@@ -218,6 +233,7 @@ where
     // Now generate random indices
     let mut nnz_inds = vec![];
     let mut last_count_idx = 0;
+    let mut index_check = vec![false; limit];
     for slice in local_start_slice..local_start_slice + local_nslices {
         let fiber_count = count_fibers_per_slice[slice - local_start_slice];
         for fiber in 0..fiber_count {
@@ -229,7 +245,9 @@ where
 
             // Create an array of size counts[i] all in the range [1, limit] ---
             // this is done with a uniform distribution here
-            nnz_inds.push(randinds(*nnz_count, limit, slice_rng.rng(slice)));
+            let inds = randinds(*nnz_count, limit, &mut index_check[..], slice_rng.rng(slice));
+            *nnz_count = inds.len();
+            nnz_inds.push(inds);
         }
         last_count_idx += fiber_count;
     }
@@ -239,42 +257,54 @@ where
 
 /// Remove empty slices from the tensor coordinates.
 fn remove_empty_slices<C: AnyCommunicator>(co: &mut [Vec<usize>], comm: &C) {
-    for m in 0..3 {
-        let local_max_dim = co[m].iter().max().expect("missing max value") + 1;
-        let mut max_dim: usize = 0;
-        comm.all_reduce_into(&local_max_dim, &mut max_dim, SystemOperation::max());
+    let max_dims: Vec<usize> = co
+        .iter()
+        .map(|co_vals| co_vals.iter().max().expect("missing max value") + 1)
+        .collect();
+    let mut global_max_dims: Vec<usize> = vec![0; co.len()];
+    comm.all_reduce_into(
+        &max_dims[..],
+        &mut global_max_dims[..],
+        SystemOperation::max(),
+    );
 
-        // Count local indices
-        let mut local_nnz_counts = vec![0; max_dim];
-        for co_val in &co[m] {
-            local_nnz_counts[*co_val] += 1;
+    // Compute the nonzero slices
+    let mut nonzero_slices: Vec<Vec<u8>> = (0..co.len())
+        .map(|m| vec![0; global_max_dims[m]])
+        .collect();
+    for i in 0..co[0].len() {
+        for m in 0..co.len() {
+            nonzero_slices[m][co[m][i]] = 1;
         }
+    }
 
-        // First compute empty slices by setting the count of nnzs in
-        // index_updates, then use this to update the indices to remove empty
-        // slices.
-        let mut global_nnz_counts = vec![0; max_dim];
+    let mut index_shifts: Vec<Vec<usize>> = vec![];
+    for m in 0..co.len() {
+        // Compute the global nonzero slices.
+        let mut global_nonzero_slices: Vec<u8> = vec![0; global_max_dims[m]];
         comm
-            .process_at_rank(0)
             .all_reduce_into(
-                &local_nnz_counts,
-                &mut global_nnz_counts,
+                &nonzero_slices[m],
+                &mut global_nonzero_slices,
                 SystemOperation::sum(),
             );
         // Compute the amount to shift every index over by to remove the empty
         // slices.
-        let shifts: Vec<usize> = global_nnz_counts
+        let shifts: Vec<usize> = global_nonzero_slices
             .iter()
-            .map(|&count| if count == 0 { 1 } else { 0 })
+            .map(|&nonzero| if nonzero == 0 { 1 } else { 0 })
             .scan(0, |state, count| {
                 *state += count;
                 Some(*state)
             })
             .collect();
+        index_shifts.push(shifts);
+    }
 
-        // Now remove the slices
-        for co_val in &mut co[m] {
-            *co_val -= shifts[*co_val];
+    // Remove the empty slices
+    for i in 0..co[0].len() {
+        for m in 0..co.len() {
+            co[m][i] -= index_shifts[m][co[m][i]];
         }
     }
 }
@@ -349,54 +379,30 @@ where
         &mut slice_rng,
     );
     if rank == 0 {
-        println!("==> distribute_nnzs_per_fiber_time={}s", nnz_timer.elapsed().as_secs_f64());
+        println!("==> distribute_nnzs_per_fiber_time={}s",
+                 nnz_timer.elapsed().as_secs_f64());
     }
 
     let set_nnz_timer = Instant::now();
+    // Value distribution for entry values.
     let value_distr = Uniform::new(0.0, 1.0)
         .expect("failed to create uniform distribution for tensor values");
     let mut fiber_nnz_idx = 0;
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
-    let mut local_nnz = 0;
     for slice in local_start_slice..local_start_slice + local_nslices {
-        // Duplicate tracking set --- this can be done per slice here, since each new
-        // slice has a different space of possible nonzeros.
-        let mut co_set = HashSet::new();
-        // Uniform generator in case of duplicates
-        let nnz_distr = Uniform::new(0, tensor_opts.dims[2] - 1)
-            .expect("failed to create uniform distribution");
+        let mut prev_count = vals.len();
         for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
             let fiber_idx = fiber_indices[slice - local_start_slice][fiber];
             for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
-                let mut tmp_co = vec![];
-                tmp_co.push(slice);
-                // TODO: Shouldn't these be switched?
-                tmp_co.push(fiber_idx);
-                tmp_co.push(nonzero_indices[fiber_nnz_idx][k]);
-
-                // Generate a new coordinate if we have a duplicate
-                let mut attempts = 0;
-                while co_set.contains(&tmp_co) && attempts < 8 {
-                    tmp_co.pop();
-                    tmp_co.push(nnz_distr.sample(slice_rng.rng(slice)));
-                    attempts += 1;
-                }
-                if co_set.contains(&tmp_co) {
-                    // Give up, we can't find another coordinate
-                    continue;
-                }
-                co_set.insert(tmp_co.to_vec());
-
                 // Add the nonzero
-                for (i, id) in tmp_co.iter().enumerate() {
-                    co[i].push(*id);
-                }
+                co[0].push(slice);
+                co[1].push(fiber_idx);
+                co[2].push(nonzero_indices[fiber_nnz_idx][k]);
                 vals.push(value_distr.sample(slice_rng.rng(slice)));
             }
             fiber_nnz_idx += 1;
         }
-        local_nnz += co_set.len();
     }
     if rank == 0 {
         println!("==> set_nnz_time={}s", set_nnz_timer.elapsed().as_secs_f64());
@@ -404,9 +410,10 @@ where
 
     // Check for and remove any empty slices
     let empty_slice_timer = Instant::now();
-    remove_empty_slices(&mut co, comm);
+    remove_empty_slices(&mut co[..], comm);
     if rank == 0 {
-        println!("==> remove_empty_slice_time={}s", empty_slice_timer.elapsed().as_secs_f64());
+        println!("==> remove_empty_slice_time={}s",
+                 empty_slice_timer.elapsed().as_secs_f64());
     }
 
     if rank == 0 {

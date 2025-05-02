@@ -1,6 +1,5 @@
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
-use sparse_tensor::SparseTensor;
 use sparse_tensor::synthetic::{TensorOptions, gentensor};
 
 fn main() {
