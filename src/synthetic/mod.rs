@@ -259,7 +259,7 @@ where
 fn remove_empty_slices<C: AnyCommunicator>(co: &mut [Vec<usize>], comm: &C) {
     let max_dims: Vec<usize> = co
         .iter()
-        .map(|co_vals| co_vals.iter().max().expect("missing max value") + 1)
+        .map(|co_vals| co_vals.iter().max().unwrap_or(0) + 1)
         .collect();
     let mut global_max_dims: Vec<usize> = vec![0; co.len()];
     comm.all_reduce_into(
@@ -330,7 +330,6 @@ where
     let local_start_slice = rank * slices_per_rank;
     // Each rank gets slices_per_rank slices, with the last one getting any leftovers
     let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { slice_count % rank } else { 0 };
-    assert!(local_nslices > 0);
     let mut slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
 
     let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
