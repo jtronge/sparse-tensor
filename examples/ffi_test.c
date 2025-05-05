@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <assert.h>
+#include <mpi.h>
 #include "sparse_tensor.h"
 
 int main(void)

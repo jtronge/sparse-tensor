@@ -40,7 +40,12 @@ pub struct TensorOptions {
 }
 
 /// Return n indices each uniformly distributed from [0, limit)
-fn randinds<R: Rng>(n: usize, limit: usize, index_check: &mut [bool], rng: &mut R) -> Vec<usize> {
+fn randinds<R: Rng>(
+    n: usize,
+    limit: usize,
+    index_check: &mut [bool],
+    rng: &mut R,
+) -> Vec<usize> {
     assert_eq!(index_check.len(), limit);
     index_check.fill(false);
     let distr = Uniform::new(0, limit - 1).expect("failed to create uniform distribution");
@@ -259,7 +264,7 @@ where
 fn remove_empty_slices<C: AnyCommunicator>(co: &mut [Vec<usize>], comm: &C) {
     let max_dims: Vec<usize> = co
         .iter()
-        .map(|co_vals| co_vals.iter().max().unwrap_or(0) + 1)
+        .map(|co_vals| co_vals.iter().max().unwrap_or(&0) + 1)
         .collect();
     let mut global_max_dims: Vec<usize> = vec![0; co.len()];
     comm.all_reduce_into(
