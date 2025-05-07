@@ -1,5 +1,4 @@
 //! Tensor feature analysis and helping library.
-use std::collections::{HashSet, HashMap};
 use std::time::Instant;
 use mpi::Count;
 use mpi::datatype::{Partition, PartitionMut};
@@ -137,12 +136,6 @@ struct Analysis {
 
     /// Local slice pointers (as with a CSF).
     local_slice_ptrs: Vec<usize>,
-
-    /// Local start slice.
-    local_start_slice: usize,
-
-    /// Local slice count.
-    local_slice_count: usize,
 }
 
 impl Analysis {
@@ -156,29 +149,11 @@ impl Analysis {
             println!("==> sort_slice_time={}s", sort_slice_timer.elapsed().as_secs_f64());
         }
 
-        // Compute the slice bounds.
-        let (local_start_slice, local_slice_count) = if local_tensor.count() > 0 {
-            let local_first_slice = *local_tensor.co[0]
-                .iter()
-                .min()
-                .expect("failed to get minimum slice");
-            let max_slice_val = local_tensor.co[0]
-                .iter()
-                .max()
-                .expect("failed to get maximum slice");
-            let local_slice_count = max_slice_val - local_first_slice + 1;
-            (local_first_slice, local_slice_count)
-        } else {
-            (0, 0)
-        };
-
         Analysis {
             local_tensor,
             global_dims,
             global_nnz,
             local_slice_ptrs,
-            local_start_slice,
-            local_slice_count,
         }
     }
 
@@ -187,35 +162,38 @@ impl Analysis {
         let mut fiber_count = 0;
         let mut fibers_per_slice_square = 0;
         let mut fibers_per_slice_max = 0;
+        let mut nonzero_fiber_count_set = vec![0; self.global_dims[2]];
         // Iterate over each slice
         for i in 0..self.local_slice_ptrs.len()-1 {
             // These are the X(i, :, k) fibers
             // Count number of nonzeros in each fiber
-            let mut nonzero_fibers = HashSet::new();
+            nonzero_fiber_count_set.fill(0);
             // Now iterate over every nonzero within the slice
             for j in self.local_slice_ptrs[i]..self.local_slice_ptrs[i+1] {
                 let fiber_idx = self.local_tensor.co[2][j];
-                if !nonzero_fibers.contains(&fiber_idx) {
-                    nonzero_fibers.insert(fiber_idx);
-                }
+                nonzero_fiber_count_set[fiber_idx] += 1;
             }
-            fiber_count += nonzero_fibers.len();
-            fibers_per_slice_square += nonzero_fibers.len() * nonzero_fibers.len();
-            fibers_per_slice_max = std::cmp::max(fibers_per_slice_max, nonzero_fibers.len());
+            let nonzero_fiber_count = nonzero_fiber_count_set
+                .iter()
+                .map(|count| if *count > 0 { 1 } else { 0 })
+                .sum();
+            fiber_count += nonzero_fiber_count;
+            fibers_per_slice_square += nonzero_fiber_count * nonzero_fiber_count;
+            fibers_per_slice_max = std::cmp::max(
+                fibers_per_slice_max,
+                nonzero_fiber_count,
+            );
         }
 
-        let mut global_fiber_count: usize = 0;
+        // All-reduce communication.
+        let mut tmp = [0usize; 2];
         comm.all_reduce_into(
-            &fiber_count,
-            &mut global_fiber_count,
+            &[fiber_count, fibers_per_slice_square],
+            &mut tmp,
             SystemOperation::sum(),
         );
-        let mut global_fibers_per_slice_square: usize = 0;
-        comm.all_reduce_into(
-            &fibers_per_slice_square,
-            &mut global_fibers_per_slice_square,
-            SystemOperation::sum(),
-        );
+        let global_fiber_count = tmp[0];
+        let global_fibers_per_slice_square = tmp[1];
         let mut global_fibers_per_slice_max: usize = 0;
         comm.all_reduce_into(
             &fibers_per_slice_max,
@@ -224,10 +202,14 @@ impl Analysis {
         );
 
         let global_fibers_per_slice_density = global_fiber_count as f64
-                                              / (self.global_dims[0] * self.global_dims[2]) as f64;
-        let global_fibers_per_slice_mean = global_fiber_count as f64 / self.global_dims[0] as f64;
-        let global_fibers_per_slice_std_dev = (global_fibers_per_slice_square as f64 / self.global_dims[0] as f64
-                                               - global_fibers_per_slice_mean * global_fibers_per_slice_mean).sqrt();
+                                              / (self.global_dims[0]
+                                                 * self.global_dims[2]) as f64;
+        let global_fibers_per_slice_mean = global_fiber_count as f64
+                                           / self.global_dims[0] as f64;
+        let global_fibers_per_slice_std_dev = (global_fibers_per_slice_square as f64
+                                               / self.global_dims[0] as f64
+                                               - global_fibers_per_slice_mean
+                                                 * global_fibers_per_slice_mean).sqrt();
         // Imbalance calculated as (max - average) / max
         let global_fibers_per_slice_imbalance = (global_fibers_per_slice_max as f64
                                                  - global_fibers_per_slice_mean)
@@ -245,50 +227,42 @@ impl Analysis {
         let mut nnz_total = 0;
         let mut nnz_per_fiber_square = 0;
         let mut nnz_per_fiber_max = 0;
+        // These are the X(i, :, k) fibers
+        let mut nonzero_fibers_set = vec![0; self.global_dims[2]];
         // Iterate over each slice
         for i in 0..self.local_slice_ptrs.len()-1 {
-            // These are the X(i, :, k) fibers
-            let mut nonzero_fibers = HashMap::new();
+            nonzero_fibers_set.fill(0);
             // Now iterate over every nonzero within the slice
             for j in self.local_slice_ptrs[i]..self.local_slice_ptrs[i+1] {
                 let fiber_idx = self.local_tensor.co[2][j];
-                let nnz_idx = self.local_tensor.co[1][j];
-                if let Some(count) = nonzero_fibers.get_mut(&fiber_idx) {
-                    *count += 1;
-                } else {
-                    nonzero_fibers.insert(fiber_idx, 1);
-                }
+                nonzero_fibers_set[fiber_idx] += 1;
             }
-            nnz_total += nonzero_fibers
+            nnz_total += nonzero_fibers_set
                 .iter()
-                .map(|(_, &count)| count)
                 .sum::<usize>();
-            nnz_per_fiber_square += nonzero_fibers
+            nnz_per_fiber_square += nonzero_fibers_set
                 .iter()
-                .map(|(_, &count)| count * count)
+                .map(|&count| count * count)
                 .sum::<usize>();
-            let max_now = nonzero_fibers
+            let max_now = nonzero_fibers_set
                 .iter()
-                .map(|(_, &count)| count)
                 .max()
                 .expect("failed to get max number of nnzs in a slice");
-            nnz_per_fiber_max = std::cmp::max(nnz_per_fiber_max, max_now);
+            nnz_per_fiber_max = std::cmp::max(nnz_per_fiber_max, *max_now);
         }
 
-        let mut global_nnz: usize = 0;
+        // All-reduce communication.
+        let mut tmp = [0usize; 2];
         comm.all_reduce_into(
-            &nnz_total,
-            &mut global_nnz,
+            &[nnz_total, nnz_per_fiber_square],
+            &mut tmp,
             SystemOperation::sum(),
         );
+        let global_nnz = tmp[0];
+        let global_nnz_per_fiber_square = tmp[1];
         assert_eq!(global_nnz, self.global_nnz);
-        let mut global_nnz_per_fiber_square = 0;
-        comm.all_reduce_into(
-            &nnz_per_fiber_square,
-            &mut global_nnz_per_fiber_square,
-            SystemOperation::sum(),
-        );
         assert!(global_nnz_per_fiber_square > global_nnz);
+
         let mut global_nnz_per_fiber_max: usize = 0;
         comm.all_reduce_into(
             &nnz_per_fiber_max,
@@ -328,7 +302,7 @@ where
 
     // Redistribute the tensor using a 1D distribution across the ranks.
     let redistribute_timer = Instant::now();
-    let mut local_tensor = redistribute_1d(tensor, &dims[..], 0, comm);
+    let local_tensor = redistribute_1d(tensor, &dims[..], 0, comm);
     if rank == 0 {
         println!("==> redistribute_time={}s", redistribute_timer.elapsed().as_secs_f64());
     }

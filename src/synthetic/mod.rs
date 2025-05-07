@@ -2,8 +2,6 @@
 //!
 //! Work based on Torun et al. A Sparse Tensor Generator with Efficient Feature
 //! Extraction. 2025.
-use std::collections::HashSet;
-use std::os::raw::c_int;
 use std::time::Instant;
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
@@ -13,8 +11,6 @@ use serde::{Serialize, Deserialize};
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
 use crate::SparseTensor;
-use rayon::prelude::*;
-use rayon_scan::ScanParallelIterator;
 
 mod c_api;
 
@@ -47,6 +43,8 @@ fn randinds<R: Rng>(
     rng: &mut R,
 ) -> Vec<usize> {
     assert_eq!(index_check.len(), limit);
+    // TODO: This is probably what is taking the majority of the time
+    // Should switch to a hashset at a certain limit or so
     index_check.fill(false);
     let distr = Uniform::new(0, limit - 1).expect("failed to create uniform distribution");
     let mut inds = vec![];
@@ -395,7 +393,6 @@ where
     let mut co = vec![vec![]; 3];
     let mut vals = vec![];
     for slice in local_start_slice..local_start_slice + local_nslices {
-        let mut prev_count = vals.len();
         for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
             let fiber_idx = fiber_indices[slice - local_start_slice][fiber];
             for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
