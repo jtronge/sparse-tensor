@@ -1,6 +1,6 @@
 //! Tensor feature analysis.
 //!
-//! Partially based on https://arxiv.org/abs/2405.04944
+//! Partially based on <https://arxiv.org/abs/2405.04944>
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Instant;
