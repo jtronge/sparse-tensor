@@ -1,6 +1,7 @@
 use mpi::traits::*;
 use mpi::collective::SystemOperation;
 use sparse_tensor::synthetic::{TensorOptions, gentensor};
+use sparse_tensor::feat;
 
 fn main() {
     let universe = mpi::initialize().expect("failed to initialize MPI");
@@ -39,4 +40,7 @@ fn main() {
                 .reduce_into(&local_nnz_counts, SystemOperation::sum());
         }
     }
+
+    // Validate the resulting features of the tensor.
+    feat::analyze_tensor(&tensor, &world);
 }
