@@ -312,6 +312,87 @@ fn remove_empty_slices<C: AnyCommunicator>(co: &mut [Vec<usize>], comm: &C) {
     }
 }
 
+struct TensorGenerator<'a, C> {
+    /// Input tensor options to generate for.
+    opts: TensorOptions,
+
+    /// Communicator object.
+    comm: &'a C,
+
+    /// Start slice on this rank.
+    local_start_slice: usize,
+
+    /// Number of slices on this rank.
+    local_nslices: usize,
+
+    slice_rng: SliceRng,
+
+    nonzero_fiber_count: usize,
+
+    mean_fibers_per_slice: f64,
+
+    std_dev_fibers_per_slice: f64,
+
+    max_fibers_per_slice: usize,
+}
+
+impl<'a, C> TensorGenerator<'a, C>
+where
+    C: AnyCommunicator
+{
+    pub fn new(tensor_opts: TensorOptions, comm: &'a C) -> TensorGenerator<'a, C> {
+        let size: usize = comm.size().try_into().expect("failed to convert size");
+        let rank: usize = comm.rank().try_into().expect("failed to convert size");
+
+        let slice_count = tensor_opts.dims[0];
+        let slices_per_rank = slice_count / size;
+        let local_start_slice = rank * slices_per_rank;
+        // Each rank gets slices_per_rank slices, with the last one getting any leftovers
+        let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { slice_count % rank } else { 0 };
+        let mut slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
+        let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
+                                          * tensor_opts.dims[2]) as f64) as usize;
+        let slice_count = tensor_opts.dims[0];
+        let nonzero_fiber_count = (tensor_opts.fiber_density
+                                   * (slice_count * tensor_opts.dims[1]) as f64) as usize;
+        let mean_fibers_per_slice = nonzero_fiber_count as f64 / slice_count as f64;
+        let std_dev_fibers_per_slice = tensor_opts.cv_fibers_per_slice * mean_fibers_per_slice;
+        let max_fibers_per_slice = tensor_opts.dims[1];
+
+        TensorGenerator {
+            opts: tensor_opts,
+            comm,
+            local_start_slice,
+            local_nslices,
+            slice_rng,
+            nonzero_fiber_count,
+            mean_fibers_per_slice,
+            std_dev_fibers_per_slice,
+            max_fibers_per_slice,
+        }
+    }
+
+    fn compute_fibers(&mut self) {
+        // Compute number and indicies of fibers per slice
+        let fiber_timer = Instant::now();
+        let (count_fibers_per_slice, fiber_indices) = distribute_fibers_per_slice(
+            self.local_start_slice,
+            self.local_nslices,
+            self.nonzero_fiber_count,
+            self.mean_fibers_per_slice,
+            self.std_dev_fibers_per_slice,
+            self.max_fibers_per_slice,
+            self.opts.dims[1],
+            self.comm,
+            &mut self.slice_rng,
+        );
+        let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
+        if self.comm.rank() == 0 {
+            println!("==> distribute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64());
+        }
+    }
+}
+
 /// Generate a tensor based on the input metrics.
 ///
 /// Based on the following paper:
@@ -328,39 +409,11 @@ where
     if rank == 0 {
         println!("==> starting sparse_tensor generator");
     }
-    let slice_count = tensor_opts.dims[0];
-    let slices_per_rank = slice_count / size;
-    let local_start_slice = rank * slices_per_rank;
-    // Each rank gets slices_per_rank slices, with the last one getting any leftovers
-    let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { slice_count % rank } else { 0 };
-    let mut slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
 
-    let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
-                                          * tensor_opts.dims[2]) as f64) as usize;
-    let slice_count = tensor_opts.dims[0];
-    let nonzero_fiber_count = (tensor_opts.fiber_density
-                               * (slice_count * tensor_opts.dims[1]) as f64) as usize;
-    let mean_fibers_per_slice = nonzero_fiber_count as f64 / slice_count as f64;
-    let std_dev_fibers_per_slice = tensor_opts.cv_fibers_per_slice * mean_fibers_per_slice;
-    let max_fibers_per_slice = tensor_opts.dims[1];
+    let mut generator = TensorGenerator::new(tensor_opts, comm);
+    generator.compute_fibers();
 
-    // Compute number and indicies of fibers per slice
-    let fiber_timer = Instant::now();
-    let (count_fibers_per_slice, fiber_indices) = distribute_fibers_per_slice(
-        local_start_slice,
-        local_nslices,
-        nonzero_fiber_count,
-        mean_fibers_per_slice,
-        std_dev_fibers_per_slice,
-        max_fibers_per_slice,
-        tensor_opts.dims[1],
-        comm,
-        &mut slice_rng,
-    );
-    let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
-    if rank == 0 {
-        println!("==> distribute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64());
-    }
+/*
 
     // Compute nonzeros per fiber
     let nnz_timer = Instant::now();
@@ -420,5 +473,8 @@ where
     if rank == 0 {
         println!("==> sparse_tensor_generate_time={}s", now.elapsed().as_secs_f64());
     }
+*/
+    let vals = vec![];
+    let co = vec![];
     SparseTensor::new(vals, co)
 }
