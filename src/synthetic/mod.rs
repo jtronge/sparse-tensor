@@ -319,6 +319,9 @@ struct TensorGenerator<'a, C> {
     /// Communicator object.
     comm: &'a C,
 
+    /// Total number of expected nonzeros.
+    nnz: usize,
+
     /// Start slice on this rank.
     local_start_slice: usize,
 
@@ -334,6 +337,16 @@ struct TensorGenerator<'a, C> {
     std_dev_fibers_per_slice: f64,
 
     max_fibers_per_slice: usize,
+
+    local_nonzero_fiber_count: Option<usize>,
+
+    count_fibers_per_slice: Option<Vec<usize>>,
+
+    fiber_indices: Option<Vec<Vec<usize>>>,
+
+    count_nonzeros_per_fiber: Option<Vec<usize>>,
+
+    nonzero_indices: Option<Vec<Vec<usize>>>,
 }
 
 impl<'a, C> TensorGenerator<'a, C>
@@ -362,6 +375,7 @@ where
         TensorGenerator {
             opts: tensor_opts,
             comm,
+            nnz,
             local_start_slice,
             local_nslices,
             slice_rng,
@@ -369,6 +383,11 @@ where
             mean_fibers_per_slice,
             std_dev_fibers_per_slice,
             max_fibers_per_slice,
+            local_nonzero_fiber_count: None,
+            count_fibers_per_slice: None,
+            fiber_indices: None,
+            count_nonzeros_per_fiber: None,
+            nonzero_indices: None,
         }
     }
 
@@ -389,6 +408,80 @@ where
         let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
         if self.comm.rank() == 0 {
             println!("==> distribute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64());
+        }
+        self.local_nonzero_fiber_count.insert(local_nonzero_fiber_count);
+        self.count_fibers_per_slice.insert(count_fibers_per_slice);
+        self.fiber_indices.insert(fiber_indices);
+    }
+
+    fn compute_nnzs(&mut self) {
+        // Compute nonzeros per fiber
+        let nnz_timer = Instant::now();
+        let mean_nonzeros_per_fiber = self.nnz as f64 / self.nonzero_fiber_count as f64;
+        let std_dev_nonzeros_per_fiber = self.opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
+        let max_nonzeros_per_fiber = self.opts.dims[2];
+        let (count_nonzeros_per_fiber, nonzero_indices) = distribute_nnzs_per_fiber(
+            self.local_start_slice,
+            self.local_nslices,
+            &self.count_fibers_per_slice
+                .as_ref()
+                .expect("missing count fibers per slice"),
+            self.local_nonzero_fiber_count
+                .expect("missing local nonzero fiber count"),
+            self.nnz,
+            mean_nonzeros_per_fiber,
+            std_dev_nonzeros_per_fiber,
+            max_nonzeros_per_fiber,
+            self.opts.dims[2],
+            self.comm,
+            &mut self.slice_rng,
+        );
+        if self.comm.rank() == 0 {
+            println!("==> distribute_nnzs_per_fiber_time={}s",
+                     nnz_timer.elapsed().as_secs_f64());
+        }
+        self.count_nonzeros_per_fiber.insert(count_nonzeros_per_fiber);
+        self.nonzero_indices.insert(nonzero_indices);
+    }
+
+    /// Fill entries of the tensor.
+    fn fill_entries(&mut self) {
+        let set_nnz_timer = Instant::now();
+        // Value distribution for entry values.
+        let value_distr = Uniform::new(0.0, 1.0)
+            .expect("failed to create uniform distribution for tensor values");
+        let mut fiber_nnz_idx = 0;
+        let mut co = vec![vec![]; 3];
+        let mut vals = vec![];
+        let count_fps = self.count_fibers_per_slice
+            .as_ref()
+            .expect("missing count fibers per slice");
+        let fiber_indices = self.fiber_indices
+            .as_ref()
+            .expect("missing fiber indices");
+        let count_npf = self.count_nonzeros_per_fiber
+            .as_ref()
+            .expect("missing count nonzeros per fiber");
+        let nonzero_indices = self.nonzero_indices
+            .as_ref()
+            .expect("missing nonzero indices");
+        let start_slice = self.local_start_slice;
+        let limit_slice = self.local_start_slice + self.local_nslices;
+        for slice in start_slice..limit_slice {
+            for fiber in 0..count_fps[slice - self.local_start_slice] {
+                let fiber_idx = fiber_indices[slice - self.local_start_slice][fiber];
+                for k in 0..count_npf[fiber_nnz_idx] {
+                    // Add the nonzero
+                    co[0].push(slice);
+                    co[1].push(fiber_idx);
+                    co[2].push(nonzero_indices[fiber_nnz_idx][k]);
+                    vals.push(value_distr.sample(self.slice_rng.rng(slice)));
+                }
+                fiber_nnz_idx += 1;
+            }
+        }
+        if self.comm.rank() == 0 {
+            println!("==> set_nnz_time={}s", set_nnz_timer.elapsed().as_secs_f64());
         }
     }
 }
@@ -412,55 +505,10 @@ where
 
     let mut generator = TensorGenerator::new(tensor_opts, comm);
     generator.compute_fibers();
+    generator.compute_nnzs();
+    generator.fill_entries();
 
 /*
-
-    // Compute nonzeros per fiber
-    let nnz_timer = Instant::now();
-    let mean_nonzeros_per_fiber = nnz as f64 / nonzero_fiber_count as f64;
-    let std_dev_nonzeros_per_fiber = tensor_opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
-    let max_nonzeros_per_fiber = tensor_opts.dims[2];
-    let (count_nonzeros_per_fiber, nonzero_indices) = distribute_nnzs_per_fiber(
-        local_start_slice,
-        local_nslices,
-        &count_fibers_per_slice[..],
-        local_nonzero_fiber_count,
-        nnz,
-        mean_nonzeros_per_fiber,
-        std_dev_nonzeros_per_fiber,
-        max_nonzeros_per_fiber,
-        tensor_opts.dims[2],
-        comm,
-        &mut slice_rng,
-    );
-    if rank == 0 {
-        println!("==> distribute_nnzs_per_fiber_time={}s",
-                 nnz_timer.elapsed().as_secs_f64());
-    }
-
-    let set_nnz_timer = Instant::now();
-    // Value distribution for entry values.
-    let value_distr = Uniform::new(0.0, 1.0)
-        .expect("failed to create uniform distribution for tensor values");
-    let mut fiber_nnz_idx = 0;
-    let mut co = vec![vec![]; 3];
-    let mut vals = vec![];
-    for slice in local_start_slice..local_start_slice + local_nslices {
-        for fiber in 0..count_fibers_per_slice[slice - local_start_slice] {
-            let fiber_idx = fiber_indices[slice - local_start_slice][fiber];
-            for k in 0..count_nonzeros_per_fiber[fiber_nnz_idx] {
-                // Add the nonzero
-                co[0].push(slice);
-                co[1].push(fiber_idx);
-                co[2].push(nonzero_indices[fiber_nnz_idx][k]);
-                vals.push(value_distr.sample(slice_rng.rng(slice)));
-            }
-            fiber_nnz_idx += 1;
-        }
-    }
-    if rank == 0 {
-        println!("==> set_nnz_time={}s", set_nnz_timer.elapsed().as_secs_f64());
-    }
 
     // Check for and remove any empty slices
     let empty_slice_timer = Instant::now();

@@ -17,7 +17,3 @@ rayon-scan = "0.1.1"
 
 [lib]
 crate-type = ["lib", "cdylib"]
-
-[[bin]]
-name = "unique_tensor"
-path = "mpi_tests/unique_tensor.rs"
