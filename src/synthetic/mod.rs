@@ -2,7 +2,6 @@
 //!
 //! Work based on Torun et al. A Sparse Tensor Generator with Efficient Feature
 //! Extraction. 2025.
-use std::time::Instant;
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
 use rand_chacha::rand_core::SeedableRng;
@@ -347,6 +346,12 @@ struct TensorGenerator<'a, C> {
     count_nonzeros_per_fiber: Option<Vec<usize>>,
 
     nonzero_indices: Option<Vec<Vec<usize>>>,
+
+    /// Generated tensor coordinates.
+    pub co: Option<Vec<Vec<usize>>>,
+
+    /// Generated tensor values.
+    pub vals: Option<Vec<f64>>,
 }
 
 impl<'a, C> TensorGenerator<'a, C>
@@ -362,7 +367,7 @@ where
         let local_start_slice = rank * slices_per_rank;
         // Each rank gets slices_per_rank slices, with the last one getting any leftovers
         let local_nslices = slices_per_rank + if rank == (size - 1) && size != 1 { slice_count % rank } else { 0 };
-        let mut slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
+        let slice_rng = SliceRng::new(&tensor_opts, local_start_slice, local_nslices);
         let nnz = (tensor_opts.nnz_density * (tensor_opts.dims[0] * tensor_opts.dims[1]
                                           * tensor_opts.dims[2]) as f64) as usize;
         let slice_count = tensor_opts.dims[0];
@@ -388,12 +393,13 @@ where
             fiber_indices: None,
             count_nonzeros_per_fiber: None,
             nonzero_indices: None,
+            co: None,
+            vals: None,
         }
     }
 
+    /// Compute number and indicies of fibers per slice
     fn compute_fibers(&mut self) {
-        // Compute number and indicies of fibers per slice
-        let fiber_timer = Instant::now();
         let (count_fibers_per_slice, fiber_indices) = distribute_fibers_per_slice(
             self.local_start_slice,
             self.local_nslices,
@@ -406,17 +412,13 @@ where
             &mut self.slice_rng,
         );
         let local_nonzero_fiber_count: usize = count_fibers_per_slice.iter().sum();
-        if self.comm.rank() == 0 {
-            println!("==> distribute_fibers_per_slice_time={}s", fiber_timer.elapsed().as_secs_f64());
-        }
-        self.local_nonzero_fiber_count.insert(local_nonzero_fiber_count);
-        self.count_fibers_per_slice.insert(count_fibers_per_slice);
-        self.fiber_indices.insert(fiber_indices);
+        let _ = self.local_nonzero_fiber_count.insert(local_nonzero_fiber_count);
+        let _ = self.count_fibers_per_slice.insert(count_fibers_per_slice);
+        let _ = self.fiber_indices.insert(fiber_indices);
     }
 
+    /// Compute nonzeros per fiber
     fn compute_nnzs(&mut self) {
-        // Compute nonzeros per fiber
-        let nnz_timer = Instant::now();
         let mean_nonzeros_per_fiber = self.nnz as f64 / self.nonzero_fiber_count as f64;
         let std_dev_nonzeros_per_fiber = self.opts.cv_nonzeros_per_fiber * mean_nonzeros_per_fiber;
         let max_nonzeros_per_fiber = self.opts.dims[2];
@@ -436,17 +438,12 @@ where
             self.comm,
             &mut self.slice_rng,
         );
-        if self.comm.rank() == 0 {
-            println!("==> distribute_nnzs_per_fiber_time={}s",
-                     nnz_timer.elapsed().as_secs_f64());
-        }
-        self.count_nonzeros_per_fiber.insert(count_nonzeros_per_fiber);
-        self.nonzero_indices.insert(nonzero_indices);
+        let _ = self.count_nonzeros_per_fiber.insert(count_nonzeros_per_fiber);
+        let _ = self.nonzero_indices.insert(nonzero_indices);
     }
 
     /// Fill entries of the tensor.
     fn fill_entries(&mut self) {
-        let set_nnz_timer = Instant::now();
         // Value distribution for entry values.
         let value_distr = Uniform::new(0.0, 1.0)
             .expect("failed to create uniform distribution for tensor values");
@@ -480,9 +477,8 @@ where
                 fiber_nnz_idx += 1;
             }
         }
-        if self.comm.rank() == 0 {
-            println!("==> set_nnz_time={}s", set_nnz_timer.elapsed().as_secs_f64());
-        }
+        let _ = self.co.insert(co);
+        let _ = self.vals.insert(vals);
     }
 }
 
@@ -495,19 +491,10 @@ pub fn gentensor<C>(tensor_opts: TensorOptions, comm: &C) -> SparseTensor
 where
     C: AnyCommunicator
 {
-    let size: usize = comm.size().try_into().expect("failed to convert size");
-    let rank: usize = comm.rank().try_into().expect("failed to convert size");
-
-    let now = Instant::now();
-    if rank == 0 {
-        println!("==> starting sparse_tensor generator");
-    }
-
     let mut generator = TensorGenerator::new(tensor_opts, comm);
     generator.compute_fibers();
     generator.compute_nnzs();
     generator.fill_entries();
-
 /*
 
     // Check for and remove any empty slices
@@ -522,7 +509,8 @@ where
         println!("==> sparse_tensor_generate_time={}s", now.elapsed().as_secs_f64());
     }
 */
-    let vals = vec![];
-    let co = vec![];
-    SparseTensor::new(vals, co)
+    SparseTensor::new(
+        generator.vals.take().expect("missing values"),
+        generator.co.take().expect("missing coordinates"),
+    )
 }
